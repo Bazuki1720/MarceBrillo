@@ -1,6 +1,7 @@
 let CURRENT_USER = null;
 let CATEGORIES = [];
 const view = document.getElementById('view');
+let navigationToken = 0;
 
 async function init() {
   try {
@@ -30,20 +31,24 @@ function parseHash() {
 }
 
 async function router() {
+  const currentToken = ++navigationToken;
   const { route, params } = parseHash();
   view.innerHTML = '<div class="loading">Cargando…</div>';
   try {
-    if (route === 'dashboard' || route === '') return renderDashboard();
-    if (route === 'inventario') return renderInventory();
-    if (route === 'producto-nuevo') return renderProductForm();
-    if (route === 'producto' && params[0]) return renderProductDetail(params[0]);
-    if (route === 'venta') return renderSale();
-    if (route === 'historial') return renderHistory();
-    if (route === 'venta-detalle' && params[0]) return renderSaleDetail(params[0]);
-    if (route === 'configuracion') return renderSettings();
-    if (route === 'informes') return renderReports();
-    return renderDashboard();
+    const render = route === 'dashboard' || route === '' ? renderDashboard
+      : route === 'inventario' ? renderInventory
+      : route === 'producto-nuevo' ? renderProductForm
+      : route === 'producto' && params[0] ? () => renderProductDetail(params[0])
+      : route === 'venta' ? renderSale
+      : route === 'historial' ? renderHistory
+      : route === 'venta-detalle' && params[0] ? () => renderSaleDetail(params[0])
+      : route === 'configuracion' ? renderSettings
+      : route === 'informes' ? renderReports
+      : renderDashboard;
+    await render();
+    if (currentToken !== navigationToken) return;
   } catch (e) {
+    if (currentToken !== navigationToken) return;
     view.innerHTML = `<div class="empty-state"><div class="icon">⚠️</div><p>${escapeHtml(e.message)}</p></div>`;
   }
 }
@@ -110,13 +115,17 @@ async function renderInventory(query) {
 
 async function loadInventoryResults(q) {
   const container = document.getElementById('invResults');
+  if (!container) return;
+  const requestId = ++loadInventoryResults.lastRequestId;
   const products = await api.get('/api/products?q=' + encodeURIComponent(q || ''));
+  if (requestId !== loadInventoryResults.lastRequestId || !document.getElementById('invResults')) return;
   if (products.length === 0) {
     container.innerHTML = `<div class="empty-state"><div class="icon">🔍</div><p>No se encontraron productos.</p></div>`;
     return;
   }
   container.innerHTML = products.map(productCardHtml).join('');
 }
+loadInventoryResults.lastRequestId = 0;
 
 function productCardHtml(p) {
   const chips = p.variants
@@ -158,6 +167,10 @@ async function renderProductDetail(id) {
       <button class="btn btn-primary" onclick="openEntryModal(${p.id})">📥 Agregar mercancía</button>
       <button class="btn btn-outline" onclick="openAdjustModal(${p.id})">🛠 Ajustar inventario</button>
       <button class="btn btn-ghost" onclick="openEditProductModal(${p.id})">✏️ Editar producto</button>
+      ${CURRENT_USER.role === 'admin' ? `
+        <button class="btn btn-outline" onclick='confirmClearStock(${p.id}, ${JSON.stringify(p.reference).replace(/'/g, "&#39;")})'>🗑 Vaciar inventario</button>
+        <button class="btn btn-danger" onclick='confirmDeleteProduct(${p.id}, ${JSON.stringify(p.reference).replace(/'/g, "&#39;")})'>Eliminar producto</button>
+      ` : ''}
     </div>
 
     <h3>Movimientos recientes</h3>
@@ -165,6 +178,46 @@ async function renderProductDetail(id) {
       ${movements.length === 0 ? '<p class="helper-text">Sin movimientos aún.</p>' : movements.map(movementRow).join('')}
     </div>
   `;
+}
+
+function confirmClearStock(productId, reference) {
+  showModal(`
+    <h3>¿Vaciar inventario?</h3>
+    <p class="helper-text">Se pondrá en cero todo el stock de <strong>${reference}</strong>. El historial se conservará y esta acción no se puede deshacer.</p>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModal()">No, cancelar</button>
+      <button class="btn btn-danger" onclick="clearProductStock(${productId})">Sí, vaciar inventario</button>
+    </div>
+  `);
+}
+
+async function clearProductStock(productId) {
+  try {
+    await api.post(`/api/products/${productId}/clear-stock`);
+    closeModal();
+    toast('Inventario vaciado', 'success');
+    renderProductDetail(productId);
+  } catch (err) { toast(err.message, 'error'); }
+}
+
+function confirmDeleteProduct(productId, reference) {
+  showModal(`
+    <h3>¿Eliminar producto?</h3>
+    <p class="helper-text">Se eliminará <strong>${reference}</strong> junto con sus variantes, inventario y movimientos de prueba. Esta acción no se puede deshacer. Solo se bloquea si el producto ya tiene ventas.</p>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModal()">No, conservar</button>
+      <button class="btn btn-danger" onclick="deleteProduct(${productId})">Sí, eliminar</button>
+    </div>
+  `);
+}
+
+async function deleteProduct(productId) {
+  try {
+    await api.request('DELETE', `/api/products/${productId}`);
+    closeModal();
+    toast('Producto eliminado', 'success');
+    navigate('inventario');
+  } catch (err) { toast(err.message, 'error'); }
 }
 
 function movementRow(m) {
@@ -198,10 +251,17 @@ function openEntryModal(productId) {
       <form id="entryForm">
         <div class="field">
           <label>Variante</label>
-          <select id="entryVariant">
+          <select id="entryVariant" onchange="toggleNewEntrySize()">
             ${p.variants.map((v) => `<option value="${v.variant_id}">${escapeHtml(v.size || 'Único')} (actual: ${v.quantity})</option>`).join('')}
+            ${p.has_variants ? '<option value="new">+ Nueva talla</option>' : ''}
           </select>
         </div>
+        ${p.has_variants ? `
+          <div class="field" id="newEntrySizeField" style="display:none">
+            <label>Nueva talla</label>
+            <input id="entryNewSize" placeholder="Ej: 35" />
+          </div>
+        ` : ''}
         <div class="field">
           <label>Cantidad recibida</label>
           <input id="entryQty" type="number" min="1" required />
@@ -212,8 +272,11 @@ function openEntryModal(productId) {
     document.getElementById('entryForm').addEventListener('submit', async (e) => {
       e.preventDefault();
       try {
+        const selectedVariant = document.getElementById('entryVariant').value;
         await api.post('/api/inventory/entry', {
-          variantId: Number(document.getElementById('entryVariant').value),
+          variantId: selectedVariant === 'new' ? null : Number(selectedVariant),
+          productId: selectedVariant === 'new' ? productId : null,
+          newSize: selectedVariant === 'new' ? document.getElementById('entryNewSize').value.trim() : null,
           quantity: Number(document.getElementById('entryQty').value),
           reason: 'Entrada de mercancía',
         });
@@ -223,6 +286,12 @@ function openEntryModal(productId) {
       } catch (err) { toast(err.message, 'error'); }
     });
   });
+}
+
+function toggleNewEntrySize() {
+  const variant = document.getElementById('entryVariant');
+  const field = document.getElementById('newEntrySizeField');
+  if (variant && field) field.style.display = variant.value === 'new' ? 'block' : 'none';
 }
 
 function openAdjustModal(productId) {
@@ -422,6 +491,8 @@ function promptNewCategory() {
 
 async function submitNewProduct(e) {
   e.preventDefault();
+  const form = e.currentTarget;
+  if (form.dataset.submitting === 'true') return;
   const hasVariants = document.getElementById('pHasVariants').checked;
   const payload = {
     reference: document.getElementById('pReference').value.trim(),
@@ -440,11 +511,20 @@ async function submitNewProduct(e) {
   } else {
     payload.initialStock = Number(document.getElementById('pInitialStock').value);
   }
+  form.dataset.submitting = 'true';
+  const submitButton = form.querySelector('button[type="submit"]');
+  submitButton.disabled = true;
+  submitButton.textContent = 'Guardando...';
   try {
     const product = await api.post('/api/products', payload);
     toast('Producto creado correctamente', 'success');
     navigate('producto/' + product.id);
   } catch (err) { toast(err.message, 'error'); }
+  finally {
+    form.dataset.submitting = 'false';
+    submitButton.disabled = false;
+    submitButton.textContent = 'Guardar producto';
+  }
 }
 
 // ---------------- SALE (POS) ----------------
@@ -687,8 +767,45 @@ async function renderSettings() {
       <p><strong>${escapeHtml(CURRENT_USER.fullName)}</strong></p>
       <p class="meta">Usuario: @${escapeHtml(CURRENT_USER.username)} · Rol: ${CURRENT_USER.role}</p>
     </div>
+    ${CURRENT_USER.role === 'admin' ? `
+      <div class="card danger-zone" style="margin-bottom:20px">
+        <h3>Restablecer datos de prueba</h3>
+        <p class="helper-text">Borra productos, inventario, ventas, movimientos y categorías actuales. Conserva los usuarios para que puedas volver a entrar y restaura las categorías iniciales.</p>
+        <button class="btn btn-danger" onclick="confirmFactoryReset()">🗑 Dejar datos como de fábrica</button>
+      </div>
+    ` : ''}
     ${usersHtml}
   `;
+}
+
+function confirmFactoryReset() {
+  showModal(`
+    <h3>¿Borrar todos los datos de prueba?</h3>
+    <p class="helper-text">Esta acción eliminará definitivamente todos los productos, existencias, ventas y movimientos. No borra los usuarios administradores.</p>
+    <form id="factoryResetForm">
+      <div class="field">
+        <label for="resetConfirmation">Escribe REINICIAR para continuar</label>
+        <input id="resetConfirmation" autocomplete="off" required />
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-ghost" onclick="closeModal()">No, cancelar</button>
+        <button class="btn btn-danger" type="submit">Sí, borrar todo</button>
+      </div>
+    </form>
+  `);
+  document.getElementById('factoryResetForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (document.getElementById('resetConfirmation').value.trim() !== 'REINICIAR') {
+      return toast('Escribe REINICIAR exactamente para confirmar', 'error');
+    }
+    try {
+      await api.post('/api/admin/reset-data');
+      closeModal();
+      CATEGORIES = await api.get('/api/categories');
+      toast('Los datos fueron restablecidos', 'success');
+      renderSettings();
+    } catch (err) { toast(err.message, 'error'); }
+  });
 }
 
 function promptNewUser() {

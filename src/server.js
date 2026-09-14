@@ -82,6 +82,28 @@ app.patch('/api/users/:id', requireAuth, requireAdmin, h(async (req, res) => {
   res.json({ ok: true });
 }));
 
+app.post('/api/admin/reset-data', requireAuth, requireAdmin, h(async (req, res) => {
+  const { withTransaction } = require('./db');
+  await withTransaction(async (client) => {
+    await client.query(`
+      TRUNCATE TABLE
+        inventory_movements,
+        sale_items,
+        sales,
+        inventory,
+        product_variants,
+        products,
+        categories
+      RESTART IDENTITY CASCADE
+    `);
+    await client.query(
+      `INSERT INTO categories (name) VALUES ($1), ($2), ($3), ($4), ($5)`,
+      ['Calzado', 'Bolsos', 'Accesorios', 'Camisetas', 'Otros']
+    );
+  });
+  res.json({ ok: true });
+}));
+
 // ---------- CATEGORIES ----------
 app.get('/api/categories', requireAuth, h(async (req, res) => {
   const { rows } = await pool.query('SELECT * FROM categories WHERE active = TRUE ORDER BY name');
@@ -122,21 +144,39 @@ async function serializeProduct(product) {
 
 app.get('/api/products', requireAuth, h(async (req, res) => {
   const { q } = req.query;
-  let rows;
+  const params = [];
+  let filter = '';
   if (q && q.trim()) {
-    const like = `%${q.trim()}%`;
-    const result = await pool.query(
-      `SELECT p.* FROM products p LEFT JOIN categories c ON c.id = p.category_id
-       WHERE p.reference ILIKE $1 OR p.name ILIKE $1 OR c.name ILIKE $1
-       ORDER BY p.name`,
-      [like]
-    );
-    rows = result.rows;
-  } else {
-    const result = await pool.query('SELECT * FROM products ORDER BY name');
-    rows = result.rows;
+    params.push(`%${q.trim()}%`);
+    filter = 'WHERE p.reference ILIKE $1 OR p.name ILIKE $1 OR c.name ILIKE $1';
   }
-  res.json(await Promise.all(rows.map(serializeProduct)));
+  const { rows } = await pool.query(
+    `SELECT p.*, c.name AS category_name,
+            COALESCE(
+              json_agg(
+                json_build_object(
+                  'variant_id', pv.id,
+                  'size', pv.size,
+                  'quantity', COALESCE(i.quantity, 0)
+                ) ORDER BY pv.id
+              ) FILTER (WHERE pv.id IS NOT NULL), '[]'::json
+            ) AS variants,
+            COALESCE(SUM(i.quantity), 0)::int AS total_stock
+     FROM products p
+     LEFT JOIN categories c ON c.id = p.category_id
+     LEFT JOIN product_variants pv ON pv.product_id = p.id
+     LEFT JOIN inventory i ON i.variant_id = pv.id
+     ${filter}
+     GROUP BY p.id, c.name
+     ORDER BY p.name`,
+    params
+  );
+  res.json(rows.map((product) => ({
+    ...product,
+    price: Number(product.price),
+    variants: product.variants || [],
+    total_stock: Number(product.total_stock),
+  })));
 }));
 
 app.get('/api/products/:id', requireAuth, h(async (req, res) => {
@@ -224,17 +264,109 @@ app.put('/api/products/:id', requireAuth, h(async (req, res) => {
   res.json(await serializeProduct(updated.rows[0]));
 }));
 
-// ---------- INVENTORY ----------
-app.post('/api/inventory/entry', requireAuth, h(async (req, res) => {
-  const { variantId, quantity, reason } = req.body || {};
-  const qty = Number(quantity);
-  if (!variantId || !qty || qty <= 0) return res.status(400).json({ error: 'Variante y cantidad válida son obligatorias' });
+app.post('/api/products/:id/clear-stock', requireAuth, requireAdmin, h(async (req, res) => {
   const { withTransaction } = require('./db');
   try {
-    const newQty = await withTransaction((client) =>
-      recordMovement(client, { variantId, type: 'entrada', quantityChange: qty, reason: reason || 'Entrada de mercancía', userId: req.session.userId })
-    );
-    res.json({ ok: true, newQuantity: newQty });
+    await withTransaction(async (client) => {
+      const productRes = await client.query('SELECT id FROM products WHERE id = $1 FOR UPDATE', [req.params.id]);
+      const product = productRes.rows[0];
+      if (!product) {
+        const error = new Error('PRODUCTO_NO_ENCONTRADO');
+        error.code = 'PRODUCTO_NO_ENCONTRADO';
+        throw error;
+      }
+      const variantsRes = await client.query(
+        `SELECT pv.id, i.quantity
+         FROM product_variants pv
+         LEFT JOIN inventory i ON i.variant_id = pv.id
+         WHERE pv.product_id = $1`,
+        [product.id]
+      );
+      for (const variant of variantsRes.rows) {
+        if (variant.quantity > 0) {
+          await recordMovement(client, {
+            variantId: variant.id,
+            type: 'ajuste',
+            quantityChange: -variant.quantity,
+            reason: 'Inventario vaciado manualmente',
+            userId: req.session.userId,
+          });
+        }
+      }
+    });
+    res.json({ ok: true });
+  } catch (e) {
+    if (e.code === 'PRODUCTO_NO_ENCONTRADO') return res.status(404).json({ error: 'Producto no encontrado' });
+    throw e;
+  }
+}));
+
+app.delete('/api/products/:id', requireAuth, requireAdmin, h(async (req, res) => {
+  const { withTransaction } = require('./db');
+  try {
+    await withTransaction(async (client) => {
+      const productRes = await client.query('SELECT id FROM products WHERE id = $1 FOR UPDATE', [req.params.id]);
+      if (!productRes.rows[0]) {
+        const error = new Error('PRODUCTO_NO_ENCONTRADO');
+        error.code = 'PRODUCTO_NO_ENCONTRADO';
+        throw error;
+      }
+      const historyRes = await client.query(
+        `SELECT EXISTS (
+           SELECT 1 FROM sale_items si JOIN product_variants pv ON pv.id = si.variant_id WHERE pv.product_id = $1
+         ) AS has_sales`,
+        [req.params.id]
+      );
+      if (historyRes.rows[0].has_sales) {
+        const error = new Error('PRODUCTO_CON_VENTAS');
+        error.code = 'PRODUCTO_CON_VENTAS';
+        throw error;
+      }
+      await client.query(
+        `DELETE FROM inventory_movements im
+         USING product_variants pv
+         WHERE im.variant_id = pv.id AND pv.product_id = $1`,
+        [req.params.id]
+      );
+      await client.query('DELETE FROM products WHERE id = $1', [req.params.id]);
+    });
+    res.json({ ok: true });
+  } catch (e) {
+    if (e.code === 'PRODUCTO_NO_ENCONTRADO') return res.status(404).json({ error: 'Producto no encontrado' });
+    if (e.code === 'PRODUCTO_CON_VENTAS') {
+      return res.status(409).json({ error: 'No se puede eliminar: el producto tiene ventas registradas. Puedes vaciar su stock y marcarlo como inactivo.' });
+    }
+    throw e;
+  }
+}));
+
+// ---------- INVENTORY ----------
+app.post('/api/inventory/entry', requireAuth, h(async (req, res) => {
+  const { variantId, productId, newSize, quantity, reason } = req.body || {};
+  const qty = Number(quantity);
+  if ((!variantId && !productId) || !qty || qty <= 0) return res.status(400).json({ error: 'Variante y cantidad válida son obligatorias' });
+  const { withTransaction } = require('./db');
+  try {
+    const result = await withTransaction(async (client) => {
+      let entryVariantId = variantId;
+      if (!entryVariantId) {
+        const size = String(newSize || '').trim();
+        if (!size) throw new Error('Indica la nueva talla');
+        const productRes = await client.query('SELECT id FROM products WHERE id = $1 FOR UPDATE', [productId]);
+        if (!productRes.rows[0]) throw new Error('Producto no encontrado');
+        const variant = await getOrCreateVariant(client, productId, size);
+        entryVariantId = variant.id;
+      }
+      const newQty = await recordMovement(client, {
+        variantId: entryVariantId,
+        type: 'entrada',
+        quantityChange: qty,
+        reason: reason || 'Entrada de mercancía',
+        userId: req.session.userId,
+      });
+      return { newQuantity: newQty, variantId: entryVariantId };
+    });
+    res.json({ ok: true, ...result });
   } catch (e) {
     res.status(400).json({ error: e.message });
   }

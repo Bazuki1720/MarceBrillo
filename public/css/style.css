@@ -211,6 +211,11 @@ label { font-size: 14px; font-weight: 600; color: var(--ink-soft); display: bloc
 .product-item .ref { color: var(--gold); font-weight: 700; font-size: 13px; letter-spacing: 0.03em; }
 .product-item .name { font-size: 18px; font-weight: 700; margin: 2px 0 8px; }
 .product-item .meta { font-size: 13px; color: var(--ink-soft); margin-bottom: 8px; }
+.product-item .meta, .total-stock, .stat-card .value, .cart-bar .total-value {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
 .size-chip-row { display: flex; flex-wrap: wrap; gap: 8px; }
 .size-chip {
   background: var(--ivory);
@@ -270,6 +275,10 @@ label { font-size: 14px; font-weight: 600; color: var(--ink-soft); display: bloc
   padding: 26px 22px 30px;
   max-height: 88vh; overflow-y: auto;
 }
+.modal-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 20px; }
+.modal-actions .btn { flex: 1 1 150px; }
+.danger-zone { border-color: rgba(178, 58, 72, 0.45); }
+.danger-zone h3 { color: var(--danger); }
 @media (min-width: 640px) {
   .modal-overlay { align-items: center; }
   .modal-sheet { border-radius: 22px; }
