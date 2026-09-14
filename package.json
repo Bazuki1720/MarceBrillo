@@ -1,0 +1,19 @@
+{
+  "name": "marce-brillo-estilo",
+  "version": "1.0.0",
+  "description": "Sistema de inventario y ventas para Marce Brillo y Estilo",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node src/server.js",
+    "seed": "node src/seed.js",
+    "test": "node tests/run.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "express-session": "^1.18.0",
+    "pg": "^8.23.0"
+  }
+}
