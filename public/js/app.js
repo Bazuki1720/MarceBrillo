@@ -80,6 +80,10 @@ async function renderDashboard() {
         <div class="label">Productos con poco stock</div>
         <div class="value">${data.lowStockCount}</div>
       </div>
+      <div class="card stat-card">
+        <div class="label">Productos en stock</div>
+        <div class="value">${data.inventoryUnits}</div>
+      </div>
     </div>
     <div class="nav-grid">
       <button class="nav-tile" onclick="navigate('inventario')"><span class="icon">📦</span>Inventario</button>
@@ -101,6 +105,7 @@ async function renderInventory(query) {
       <input id="invSearch" placeholder="Buscar por referencia, nombre o categoría (ej: AJ)" value="${escapeHtml(query || '')}" />
       <button class="btn btn-outline" onclick="navigate('producto-nuevo')">➕ Nuevo</button>
     </div>
+    <div id="inventoryTotal" class="card inventory-total loading">Calculando existencias totales…</div>
     <div id="invResults" class="loading">Cargando…</div>
   `;
   const input = document.getElementById('invSearch');
@@ -110,7 +115,22 @@ async function renderInventory(query) {
     t = setTimeout(() => loadInventoryResults(input.value), 250);
   });
   input.focus();
+  loadInventoryTotal();
   loadInventoryResults(query || '');
+}
+
+async function loadInventoryTotal() {
+  const container = document.getElementById('inventoryTotal');
+  if (!container) return;
+  try {
+    const summary = await api.get('/api/inventory/summary');
+    if (!document.getElementById('inventoryTotal')) return;
+    container.className = 'card inventory-total';
+    container.innerHTML = `<span class="label">Productos en inventario</span><strong>${summary.totalUnits}</strong><span class="helper-text">Unidades disponibles en total</span>`;
+  } catch (err) {
+    container.className = 'card inventory-total error-text';
+    container.textContent = 'No se pudo cargar el total del inventario.';
+  }
 }
 
 async function loadInventoryResults(q) {

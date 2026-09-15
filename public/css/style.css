@@ -199,6 +199,10 @@ label { font-size: 14px; font-weight: 600; color: var(--ink-soft); display: bloc
 /* ---------- LISTS / TABLES ---------- */
 .searchbar { display: flex; gap: 10px; margin-bottom: 18px; }
 .searchbar input { flex: 1; }
+.inventory-total { display: flex; align-items: baseline; gap: 10px; margin-bottom: 18px; }
+.inventory-total .label { color: var(--ink-soft); font-size: 14px; font-weight: 600; }
+.inventory-total strong { color: var(--wine); font-family: var(--font-display); font-size: 30px; }
+.inventory-total .helper-text { margin: 0; }
 
 .product-item, .sale-item, .movement-item {
   background: var(--paper);

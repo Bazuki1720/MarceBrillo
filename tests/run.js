@@ -41,6 +41,12 @@ async function run() {
   r = await req('GET', '/api/categories');
   assert(r.status === 200 && r.data.length >= 5, 'Categorías por defecto existen');
 
+  r = await req('GET', '/api/inventory/summary');
+  assert(r.status === 200 && Number.isInteger(r.data.totalUnits), 'Resumen devuelve el total de unidades del inventario');
+
+  r = await req('GET', '/api/dashboard');
+  assert(r.status === 200 && Number.isInteger(r.data.inventoryUnits), 'Dashboard devuelve el total de unidades en stock');
+
   r = await req('POST', '/api/categories', { name: 'Cinturones-Test' });
   assert(r.status === 200, 'Crear categoría nueva funciona');
   const catId = r.data.id;

@@ -341,6 +341,13 @@ app.delete('/api/products/:id', requireAuth, requireAdmin, h(async (req, res) =>
 }));
 
 // ---------- INVENTORY ----------
+app.get('/api/inventory/summary', requireAuth, h(async (req, res) => {
+  const { rows } = await pool.query(
+    'SELECT COALESCE(SUM(quantity), 0)::int AS total_units FROM inventory'
+  );
+  res.json({ totalUnits: rows[0].total_units });
+}));
+
 app.post('/api/inventory/entry', requireAuth, h(async (req, res) => {
   const { variantId, productId, newSize, quantity, reason } = req.body || {};
   const qty = Number(quantity);
@@ -513,7 +520,8 @@ app.post('/api/sales/:id/void', requireAuth, h(async (req, res) => {
 app.get('/api/dashboard', requireAuth, h(async (req, res) => {
   const today = new Date().toISOString().slice(0, 10);
   const t = await reports.totals(today, today);
-  const lowStock = await pool.query(
+  const [lowStock, inventoryTotal] = await Promise.all([
+    pool.query(
     `SELECT COUNT(*)::int as c FROM (
        SELECT p.id, COALESCE(SUM(i.quantity),0) as total_stock
        FROM products p JOIN product_variants pv ON pv.product_id = p.id
@@ -521,12 +529,15 @@ app.get('/api/dashboard', requireAuth, h(async (req, res) => {
        WHERE p.status = 'activo'
        GROUP BY p.id HAVING COALESCE(SUM(i.quantity),0) <= p.low_stock_threshold
      ) x`
-  );
+    ),
+    pool.query('SELECT COALESCE(SUM(quantity), 0)::int AS total_units FROM inventory'),
+  ]);
   res.json({
     salesToday: t.revenue,
     salesCountToday: t.saleCount,
     itemsSoldToday: t.itemsSold,
     lowStockCount: lowStock.rows[0].c,
+    inventoryUnits: inventoryTotal.rows[0].total_units,
   });
 }));
 
