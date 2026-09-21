@@ -122,4 +122,30 @@ async function voidSale(saleId, userId, reason) {
   });
 }
 
-module.exports = { getOrCreateVariant, recordMovement, createSale, voidSale, pool };
+async function getReservedQuantityForVariant(client, variantId) {
+  const { rows } = await client.query(
+    `SELECT COALESCE(SUM(soi.quantity - soi.quantity_withdrawn), 0)::int AS reserved
+     FROM separated_order_items soi
+     JOIN separated_orders so ON so.id = soi.separated_order_id
+     WHERE soi.variant_id = $1 AND so.status = 'activo'`,
+    [variantId]
+  );
+  return Number(rows[0]?.reserved || 0);
+}
+
+async function getAvailableQuantityForVariant(client, variantId) {
+  const inventoryRes = await client.query('SELECT COALESCE(quantity, 0)::int AS quantity FROM inventory WHERE variant_id = $1', [variantId]);
+  const physical = Number(inventoryRes.rows[0]?.quantity || 0);
+  const reserved = await getReservedQuantityForVariant(client, variantId);
+  return physical - reserved;
+}
+
+module.exports = {
+  getOrCreateVariant,
+  recordMovement,
+  createSale,
+  voidSale,
+  getReservedQuantityForVariant,
+  getAvailableQuantityForVariant,
+  pool,
+};

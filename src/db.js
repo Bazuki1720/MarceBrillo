@@ -129,6 +129,84 @@ CREATE TABLE IF NOT EXISTS inventory_movements (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS separated_orders (
+  id SERIAL PRIMARY KEY,
+  order_number TEXT UNIQUE NOT NULL,
+  client_name TEXT NOT NULL,
+  phone TEXT NOT NULL,
+  total NUMERIC(12,2) NOT NULL DEFAULT 0,
+  paid_amount NUMERIC(12,2) NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'activo' CHECK (status IN ('activo','completado','anulado')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  due_at TIMESTAMPTZ NOT NULL,
+  canceled_at TIMESTAMPTZ,
+  canceled_by INTEGER REFERENCES users(id),
+  cancel_reason TEXT,
+  created_by INTEGER NOT NULL REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS separated_order_items (
+  id SERIAL PRIMARY KEY,
+  order_id INTEGER NOT NULL REFERENCES separated_orders(id) ON DELETE CASCADE,
+  variant_id INTEGER NOT NULL REFERENCES product_variants(id),
+  product_reference TEXT NOT NULL,
+  product_name TEXT NOT NULL,
+  size TEXT,
+  quantity INTEGER NOT NULL CHECK (quantity > 0),
+  retired_quantity INTEGER NOT NULL DEFAULT 0 CHECK (retired_quantity >= 0),
+  unit_price NUMERIC(12,2) NOT NULL,
+  subtotal NUMERIC(12,2) NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS separated_payments (
+  id SERIAL PRIMARY KEY,
+  order_id INTEGER NOT NULL REFERENCES separated_orders(id) ON DELETE CASCADE,
+  amount NUMERIC(12,2) NOT NULL CHECK (amount > 0),
+  payment_method TEXT NOT NULL DEFAULT 'efectivo' CHECK (payment_method IN ('efectivo','transferencia','addi','nequi','qr','daviplata')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  note TEXT
+);
+
+CREATE TABLE IF NOT EXISTS credit_sales (
+  id SERIAL PRIMARY KEY,
+  credit_number TEXT UNIQUE NOT NULL,
+  client_name TEXT NOT NULL,
+  phone TEXT NOT NULL,
+  total NUMERIC(12,2) NOT NULL DEFAULT 0,
+  paid_amount NUMERIC(12,2) NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pendiente' CHECK (status IN ('pendiente','pagado','anulado')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  created_by INTEGER NOT NULL REFERENCES users(id),
+  canceled_at TIMESTAMPTZ,
+  canceled_by INTEGER REFERENCES users(id),
+  cancel_reason TEXT
+);
+
+CREATE TABLE IF NOT EXISTS credit_sale_items (
+  id SERIAL PRIMARY KEY,
+  credit_sale_id INTEGER NOT NULL REFERENCES credit_sales(id) ON DELETE CASCADE,
+  variant_id INTEGER NOT NULL REFERENCES product_variants(id),
+  product_reference TEXT NOT NULL,
+  product_name TEXT NOT NULL,
+  size TEXT,
+  quantity INTEGER NOT NULL CHECK (quantity > 0),
+  unit_price NUMERIC(12,2) NOT NULL,
+  subtotal NUMERIC(12,2) NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS credit_payments (
+  id SERIAL PRIMARY KEY,
+  credit_sale_id INTEGER NOT NULL REFERENCES credit_sales(id) ON DELETE CASCADE,
+  amount NUMERIC(12,2) NOT NULL CHECK (amount > 0),
+  payment_method TEXT NOT NULL DEFAULT 'efectivo' CHECK (payment_method IN ('efectivo','transferencia','addi','nequi','qr','daviplata')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  note TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_products_reference ON products(reference);
 CREATE INDEX IF NOT EXISTS idx_products_category ON products(category_id);
 CREATE INDEX IF NOT EXISTS idx_variants_product ON product_variants(product_id);
@@ -138,6 +216,10 @@ CREATE INDEX IF NOT EXISTS idx_sale_items_sale ON sale_items(sale_id);
 CREATE INDEX IF NOT EXISTS idx_sale_items_category ON sale_items(category_id);
 CREATE INDEX IF NOT EXISTS idx_movements_variant ON inventory_movements(variant_id);
 CREATE INDEX IF NOT EXISTS idx_movements_created ON inventory_movements(created_at);
+CREATE INDEX IF NOT EXISTS idx_separated_orders_status ON separated_orders(status);
+CREATE INDEX IF NOT EXISTS idx_separated_order_items_variant ON separated_order_items(variant_id);
+CREATE INDEX IF NOT EXISTS idx_credit_sales_status ON credit_sales(status);
+CREATE INDEX IF NOT EXISTS idx_credit_sale_items_variant ON credit_sale_items(variant_id);
 
 -- Migration safety net: add category_id to sale_items if it didn't exist yet
 -- (older databases created before reports were added).

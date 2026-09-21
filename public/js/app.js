@@ -42,6 +42,10 @@ async function router() {
       : route === 'venta' ? renderSale
       : route === 'historial' ? renderHistory
       : route === 'venta-detalle' && params[0] ? () => renderSaleDetail(params[0])
+      : route === 'separados' ? renderSeparatedOrders
+      : route === 'separado-detalle' && params[0] ? () => renderSeparatedDetail(params[0])
+      : route === 'fiados' ? renderCreditSales
+      : route === 'fiado-detalle' && params[0] ? () => renderCreditDetail(params[0])
       : route === 'configuracion' ? renderSettings
       : route === 'informes' ? renderReports
       : renderDashboard;
@@ -62,6 +66,10 @@ function backLink(hash, label) {
   return `<button class="back-link" onclick="navigate('${hash}')">&larr; ${label}</button>`;
 }
 
+function normalizeSearchValue(value) {
+  return String(value ?? '').trim().toLowerCase();
+}
+
 // ---------------- DASHBOARD ----------------
 async function renderDashboard() {
   const data = await api.get('/api/dashboard');
@@ -80,6 +88,10 @@ async function renderDashboard() {
         <div class="label">Productos con poco stock</div>
         <div class="value">${data.lowStockCount}</div>
       </div>
+      <div class="card stat-card ${data.expiredSeparatedCount > 0 ? 'alert' : ''}">
+        <div class="label">Separados vencidos</div>
+        <div class="value">${data.expiredSeparatedCount || 0}</div>
+      </div>
       <div class="card stat-card">
         <div class="label">Productos en stock</div>
         <div class="value">${data.inventoryUnits}</div>
@@ -88,12 +100,367 @@ async function renderDashboard() {
     <div class="nav-grid">
       <button class="nav-tile" onclick="navigate('inventario')"><span class="icon">📦</span>Inventario</button>
       <button class="nav-tile" onclick="navigate('venta')"><span class="icon">🛒</span>Registrar venta</button>
+      <button class="nav-tile" onclick="navigate('separados')"><span class="icon">📦</span>Separados</button>
+      <button class="nav-tile" onclick="navigate('fiados')"><span class="icon">🧾</span>Fiados</button>
       <button class="nav-tile" onclick="navigate('producto-nuevo')"><span class="icon">➕</span>Nuevo producto</button>
       <button class="nav-tile" onclick="navigate('historial')"><span class="icon">📋</span>Ventas</button>
       <button class="nav-tile" onclick="navigate('informes')"><span class="icon">📊</span>Informes</button>
       <button class="nav-tile" onclick="navigate('configuracion')"><span class="icon">⚙️</span>Configuración</button>
     </div>
   `;
+}
+
+async function renderSeparatedOrders(searchTerm = '') {
+  const list = await api.get('/api/separados' + (searchTerm ? '?q=' + encodeURIComponent(searchTerm) : ''));
+  view.innerHTML = `
+    ${backLink('dashboard', 'Inicio')}
+    <h2 class="section-title">Separados</h2>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px">
+      <button class="btn btn-primary" onclick="openSeparatedModal()">➕ Nuevo separado</button>
+    </div>
+    <div class="searchbar" style="margin-bottom:18px">
+      <input id="separatedSearch" placeholder="Buscar por cliente, código o nombre del producto" value="${escapeHtml(searchTerm)}" />
+    </div>
+    ${list.length === 0 ? '<div class="empty-state"><div class="icon">📦</div><p>No hay separados registrados.</p></div>' : list.map((order) => `
+      <div class="product-item" style="cursor:pointer" onclick="navigate('separado-detalle/${order.id}')">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:12px">
+          <strong>${escapeHtml(order.order_number)}</strong>
+          <span class="badge ${order.status === 'activo' ? 'badge-gold' : order.status === 'completado' ? 'badge-ok' : 'badge-danger'}">${escapeHtml(order.status)}</span>
+        </div>
+        <div class="name">${escapeHtml(order.client_name)}</div>
+        <div class="meta">${escapeHtml(order.phone)} · ${new Date(order.created_at).toLocaleDateString('es-CO')} · vence ${new Date(order.due_at).toLocaleDateString('es-CO')}</div>
+        <div class="total-stock">Total: ${fmtMoney(order.total)} · Pagado: ${fmtMoney(order.paid_amount)} · Saldo: ${fmtMoney(order.balance || 0)}</div>
+      </div>
+    `).join('')}
+  `;
+  const input = document.getElementById('separatedSearch');
+  if (input) {
+    input.addEventListener('input', () => {
+      renderSeparatedOrders(input.value);
+    });
+  }
+}
+
+async function renderSeparatedDetail(id) {
+  const order = await api.get('/api/separados/' + id);
+  view.innerHTML = `
+    ${backLink('separados', 'Separados')}
+    <h2 class="section-title">${escapeHtml(order.order_number)}</h2>
+    <div class="card" style="margin-bottom:18px">
+      <p><strong>Cliente:</strong> ${escapeHtml(order.client_name)}</p>
+      <p><strong>Teléfono:</strong> ${escapeHtml(order.phone)}</p>
+      <p><strong>Fecha:</strong> ${new Date(order.created_at).toLocaleString('es-CO')}</p>
+      <p><strong>Fecha límite:</strong> ${new Date(order.due_at).toLocaleString('es-CO')}</p>
+      <p><strong>Estado:</strong> ${escapeHtml(order.status)}</p>
+      <p><strong>Total:</strong> ${fmtMoney(order.total)}</p>
+      <p><strong>Pagado:</strong> ${fmtMoney(order.paid_amount)}</p>
+      <p><strong>Saldo:</strong> ${fmtMoney(order.balance)}</p>
+    </div>
+    <h3>Productos</h3>
+    ${order.items.map((item) => `
+      <div class="product-item">
+        <div class="ref">${escapeHtml(item.product_reference)}</div>
+        <div class="name">${escapeHtml(item.product_name)} ${item.size ? '· talla ' + escapeHtml(item.size) : ''}</div>
+        <div class="meta">Cantidad: ${item.quantity} · Retirada: ${item.retired_quantity} · Pendiente: ${item.quantity - item.retired_quantity}</div>
+        <div class="meta">${fmtMoney(item.unit_price)} × ${item.quantity} = ${fmtMoney(item.subtotal)}</div>
+      </div>
+    `).join('')}
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin:20px 0">
+      <button class="btn btn-primary" onclick="openSeparatedPayment(${order.id})">💰 Abonar</button>
+      <button class="btn btn-outline" onclick="openSeparatedRetiro(${order.id})">📦 Retirar</button>
+      <button class="btn btn-danger" onclick="openSeparatedCancel(${order.id})">🚫 Anular</button>
+    </div>
+  `;
+}
+
+async function renderCreditSales(searchTerm = '') {
+  const list = await api.get('/api/fiados' + (searchTerm ? '?q=' + encodeURIComponent(searchTerm) : ''));
+  view.innerHTML = `
+    ${backLink('dashboard', 'Inicio')}
+    <h2 class="section-title">Fiados</h2>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px">
+      <button class="btn btn-primary" onclick="openFiadoModal()">➕ Nuevo fiado</button>
+    </div>
+    <div class="searchbar" style="margin-bottom:18px">
+      <input id="fiadoSearch" placeholder="Buscar por cliente, código o nombre del producto" value="${escapeHtml(searchTerm)}" />
+    </div>
+    ${list.length === 0 ? '<div class="empty-state"><div class="icon">🧾</div><p>No hay fiados registrados.</p></div>' : list.map((credit) => `
+      <div class="product-item" style="cursor:pointer" onclick="navigate('fiado-detalle/${credit.id}')">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:12px">
+          <strong>${escapeHtml(credit.credit_number)}</strong>
+          <span class="badge ${credit.status === 'pendiente' ? 'badge-gold' : credit.status === 'pagado' ? 'badge-ok' : 'badge-danger'}">${escapeHtml(credit.status)}</span>
+        </div>
+        <div class="name">${escapeHtml(credit.client_name)}</div>
+        <div class="meta">${escapeHtml(credit.phone)} · ${new Date(credit.created_at).toLocaleDateString('es-CO')}</div>
+        <div class="total-stock">Total: ${fmtMoney(credit.total)} · Pagado: ${fmtMoney(credit.paid_amount)} · Saldo: ${fmtMoney(credit.balance || 0)}</div>
+      </div>
+    `).join('')}
+  `;
+  const input = document.getElementById('fiadoSearch');
+  if (input) {
+    input.addEventListener('input', () => {
+      renderCreditSales(input.value);
+    });
+  }
+}
+
+async function renderCreditDetail(id) {
+  const credit = await api.get('/api/fiados/' + id);
+  view.innerHTML = `
+    ${backLink('fiados', 'Fiados')}
+    <h2 class="section-title">${escapeHtml(credit.credit_number)}</h2>
+    <div class="card" style="margin-bottom:18px">
+      <p><strong>Cliente:</strong> ${escapeHtml(credit.client_name)}</p>
+      <p><strong>Teléfono:</strong> ${escapeHtml(credit.phone)}</p>
+      <p><strong>Fecha:</strong> ${new Date(credit.created_at).toLocaleString('es-CO')}</p>
+      <p><strong>Estado:</strong> ${escapeHtml(credit.status)}</p>
+      <p><strong>Total:</strong> ${fmtMoney(credit.total)}</p>
+      <p><strong>Pagado:</strong> ${fmtMoney(credit.paid_amount)}</p>
+      <p><strong>Saldo:</strong> ${fmtMoney(credit.balance)}</p>
+    </div>
+    <h3>Productos</h3>
+    ${credit.items.map((item) => `
+      <div class="product-item">
+        <div class="ref">${escapeHtml(item.product_reference)}</div>
+        <div class="name">${escapeHtml(item.product_name)} ${item.size ? '· talla ' + escapeHtml(item.size) : ''}</div>
+        <div class="meta">Cantidad: ${item.quantity} · ${fmtMoney(item.unit_price)} c/u = ${fmtMoney(item.subtotal)}</div>
+      </div>
+    `).join('')}
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin:20px 0">
+      <button class="btn btn-primary" onclick="openFiadoPayment(${credit.id})">💰 Abonar</button>
+      <button class="btn btn-danger" onclick="openFiadoCancel(${credit.id})">🚫 Anular</button>
+    </div>
+  `;
+}
+
+async function openSeparatedModal() {
+  const products = await api.get('/api/products');
+  const usableProducts = (products || []).filter((product) => product.status === 'activo');
+  showModal(`
+    <h3>Nuevo separado</h3>
+    <form id="separatedForm">
+      <div class="field"><label>Cliente</label><input id="sepClient" required /></div>
+      <div class="field"><label>Teléfono</label><input id="sepPhone" required /></div>
+      <div class="field">
+        <label>Buscar producto</label>
+        <input id="sepProductSearch" placeholder="Código, referencia o nombre del producto" autocomplete="off" />
+      </div>
+      <div id="sepProductResults" class="search-results" style="max-height:210px;overflow:auto;margin-bottom:10px"></div>
+      <div id="sepSelectedProduct" class="helper-text" style="margin-bottom:10px">Selecciona un producto para cargar el precio automáticamente.</div>
+      <input id="sepVariant" type="hidden" />
+      <div class="field"><label>Cantidad</label><input id="sepQty" type="number" min="1" value="1" required /></div>
+      <div class="field"><label>Precio unitario</label><input id="sepPrice" type="number" min="0" step="1" value="0" required /></div>
+      <div class="field"><label>Abono inicial</label><input id="sepInitialPayment" type="number" min="0" step="1" value="0" /></div>
+      <div class="field"><label>Fecha límite</label><input id="sepDueAt" type="date" /></div>
+      <button class="btn btn-primary btn-block" type="submit">Guardar separado</button>
+    </form>
+  `);
+
+  const searchInput = document.getElementById('sepProductSearch');
+  const resultsContainer = document.getElementById('sepProductResults');
+  const selectedProductLabel = document.getElementById('sepSelectedProduct');
+  const productMatches = usableProducts.flatMap((product) => product.variants.map((variant) => ({
+    product,
+    variant,
+    searchText: `${product.reference} ${product.name} ${variant.size || ''}`,
+  })));
+
+  const renderProductMatches = (query = '') => {
+    const term = normalizeSearchValue(query);
+    const matches = !term
+      ? productMatches.slice(0, 12)
+      : productMatches.filter((entry) => normalizeSearchValue(entry.searchText).includes(term)).slice(0, 12);
+
+    resultsContainer.innerHTML = matches.length === 0 ? '<p class="helper-text">No se encontraron productos.</p>' : matches.map((entry) => `
+      <button type="button" class="btn btn-outline" style="display:block;width:100%;text-align:left;margin:6px 0;padding:10px 12px" data-variant-id="${entry.variant.variant_id}">
+        <strong>${escapeHtml(entry.product.reference)}</strong>
+        ${entry.variant.size ? ' · talla ' + escapeHtml(entry.variant.size) : ''}
+        <div class="meta">${escapeHtml(entry.product.name)} · ${fmtMoney(entry.product.price)}</div>
+      </button>
+    `).join('');
+
+    resultsContainer.querySelectorAll('button[data-variant-id]').forEach((button) => {
+      button.addEventListener('click', () => {
+        const variantId = Number(button.dataset.variantId);
+        const selectedProduct = productMatches.find((entry) => Number(entry.variant.variant_id) === variantId);
+        if (!selectedProduct) return;
+        document.getElementById('sepVariant').value = String(variantId);
+        document.getElementById('sepPrice').value = String(selectedProduct.product.price);
+        selectedProductLabel.textContent = `Seleccionado: ${selectedProduct.product.reference}${selectedProduct.variant.size ? ' · talla ' + selectedProduct.variant.size : ''} · ${fmtMoney(selectedProduct.product.price)}`;
+        searchInput.value = selectedProduct.product.reference;
+      });
+    });
+  };
+
+  searchInput.addEventListener('input', () => renderProductMatches(searchInput.value));
+  renderProductMatches();
+
+  document.getElementById('separatedForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    try {
+      const variantId = Number(document.getElementById('sepVariant').value);
+      if (!variantId) throw new Error('Busca y selecciona un producto antes de guardar el separado.');
+      await api.post('/api/separados', {
+        clientName: document.getElementById('sepClient').value,
+        phone: document.getElementById('sepPhone').value,
+        items: [{ variantId, quantity: Number(document.getElementById('sepQty').value), unitPrice: Number(document.getElementById('sepPrice').value) }],
+        initialPayment: Number(document.getElementById('sepInitialPayment').value || 0),
+        dueAt: document.getElementById('sepDueAt').value || null,
+      });
+      closeModal();
+      toast('Separado creado', 'success');
+      renderSeparatedOrders();
+    } catch (err) { toast(err.message, 'error'); }
+  });
+}
+
+async function openFiadoModal() {
+  const products = await api.get('/api/products');
+  const usableProducts = (products || []).filter((product) => product.status === 'activo');
+  showModal(`
+    <h3>Nuevo fiado</h3>
+    <form id="fiadoForm">
+      <div class="field"><label>Cliente</label><input id="fiaClient" required /></div>
+      <div class="field"><label>Teléfono</label><input id="fiaPhone" required /></div>
+      <div class="field">
+        <label>Buscar producto</label>
+        <input id="fiaProductSearch" placeholder="Código, referencia o nombre del producto" autocomplete="off" />
+      </div>
+      <div id="fiaProductResults" class="search-results" style="max-height:210px;overflow:auto;margin-bottom:10px"></div>
+      <div id="fiaSelectedProduct" class="helper-text" style="margin-bottom:10px">Selecciona un producto para cargar el precio automáticamente.</div>
+      <input id="fiaVariant" type="hidden" />
+      <div class="field"><label>Cantidad</label><input id="fiaQty" type="number" min="1" value="1" required /></div>
+      <div class="field"><label>Precio unitario</label><input id="fiaPrice" type="number" min="0" step="1" value="0" required /></div>
+      <div class="field"><label>Abono inicial</label><input id="fiaInitialPayment" type="number" min="0" step="1" value="0" /></div>
+      <button class="btn btn-primary btn-block" type="submit">Guardar fiado</button>
+    </form>
+  `);
+
+  const searchInput = document.getElementById('fiaProductSearch');
+  const resultsContainer = document.getElementById('fiaProductResults');
+  const selectedProductLabel = document.getElementById('fiaSelectedProduct');
+  const productMatches = usableProducts.flatMap((product) => product.variants.map((variant) => ({
+    product,
+    variant,
+    searchText: `${product.reference} ${product.name} ${variant.size || ''}`,
+  })));
+
+  const renderProductMatches = (query = '') => {
+    const term = normalizeSearchValue(query);
+    const matches = !term
+      ? productMatches.slice(0, 12)
+      : productMatches.filter((entry) => normalizeSearchValue(entry.searchText).includes(term)).slice(0, 12);
+
+    resultsContainer.innerHTML = matches.length === 0 ? '<p class="helper-text">No se encontraron productos.</p>' : matches.map((entry) => `
+      <button type="button" class="btn btn-outline" style="display:block;width:100%;text-align:left;margin:6px 0;padding:10px 12px" data-variant-id="${entry.variant.variant_id}">
+        <strong>${escapeHtml(entry.product.reference)}</strong>
+        ${entry.variant.size ? ' · talla ' + escapeHtml(entry.variant.size) : ''}
+        <div class="meta">${escapeHtml(entry.product.name)} · ${fmtMoney(entry.product.price)}</div>
+      </button>
+    `).join('');
+
+    resultsContainer.querySelectorAll('button[data-variant-id]').forEach((button) => {
+      button.addEventListener('click', () => {
+        const variantId = Number(button.dataset.variantId);
+        const selectedProduct = productMatches.find((entry) => Number(entry.variant.variant_id) === variantId);
+        if (!selectedProduct) return;
+        document.getElementById('fiaVariant').value = String(variantId);
+        document.getElementById('fiaPrice').value = String(selectedProduct.product.price);
+        selectedProductLabel.textContent = `Seleccionado: ${selectedProduct.product.reference}${selectedProduct.variant.size ? ' · talla ' + selectedProduct.variant.size : ''} · ${fmtMoney(selectedProduct.product.price)}`;
+        searchInput.value = selectedProduct.product.reference;
+      });
+    });
+  };
+
+  searchInput.addEventListener('input', () => renderProductMatches(searchInput.value));
+  renderProductMatches();
+
+  document.getElementById('fiadoForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    try {
+      const variantId = Number(document.getElementById('fiaVariant').value);
+      if (!variantId) throw new Error('Busca y selecciona un producto antes de guardar el fiado.');
+      await api.post('/api/fiados', {
+        clientName: document.getElementById('fiaClient').value,
+        phone: document.getElementById('fiaPhone').value,
+        items: [{ variantId, quantity: Number(document.getElementById('fiaQty').value), unitPrice: Number(document.getElementById('fiaPrice').value) }],
+        initialPayment: Number(document.getElementById('fiaInitialPayment').value || 0),
+      });
+      closeModal();
+      toast('Fiado creado', 'success');
+      renderCreditSales();
+    } catch (err) { toast(err.message, 'error'); }
+  });
+}
+
+function openSeparatedPayment(id) {
+  showModal(`
+    <h3>Abonar separado</h3>
+    <form id="sepPaymentForm">
+      <div class="field"><label>Valor</label><input id="sepPaymentAmount" type="number" min="1" step="1" required /></div>
+      <button class="btn btn-primary btn-block" type="submit">Registrar abono</button>
+    </form>
+  `);
+  document.getElementById('sepPaymentForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    try { await api.post('/api/separados/' + id + '/pagos', { amount: Number(document.getElementById('sepPaymentAmount').value) }); closeModal(); toast('Abono registrado', 'success'); renderSeparatedDetail(id); } catch (err) { toast(err.message, 'error'); }
+  });
+}
+
+function openFiadoPayment(id) {
+  showModal(`
+    <h3>Abonar fiado</h3>
+    <form id="fiaPaymentForm">
+      <div class="field"><label>Valor</label><input id="fiaPaymentAmount" type="number" min="1" step="1" required /></div>
+      <button class="btn btn-primary btn-block" type="submit">Registrar abono</button>
+    </form>
+  `);
+  document.getElementById('fiaPaymentForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    try { await api.post('/api/fiados/' + id + '/pagos', { amount: Number(document.getElementById('fiaPaymentAmount').value) }); closeModal(); toast('Abono registrado', 'success'); renderCreditDetail(id); } catch (err) { toast(err.message, 'error'); }
+  });
+}
+
+function openSeparatedRetiro(id) {
+  showModal(`
+    <h3>Retirar separado</h3>
+    <form id="sepRetiroForm">
+      <div class="field"><label>Cantidad a retirar</label><input id="sepRetiroQty" type="number" min="1" step="1" required /></div>
+      <button class="btn btn-primary btn-block" type="submit">Retirar</button>
+    </form>
+  `);
+  document.getElementById('sepRetiroForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    try { await api.post('/api/separados/' + id + '/retiro', { quantity: Number(document.getElementById('sepRetiroQty').value) }); closeModal(); toast('Retiro registrado', 'success'); renderSeparatedDetail(id); } catch (err) { toast(err.message, 'error'); }
+  });
+}
+
+function openSeparatedCancel(id) {
+  showModal(`
+    <h3>Anular separado</h3>
+    <form id="sepCancelForm">
+      <div class="field"><label>Motivo</label><input id="sepCancelReason" required /></div>
+      <button class="btn btn-danger btn-block" type="submit">Confirmar anulación</button>
+    </form>
+  `);
+  document.getElementById('sepCancelForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    try { await api.post('/api/separados/' + id + '/anular', { reason: document.getElementById('sepCancelReason').value }); closeModal(); toast('Separado anulado', 'success'); renderSeparatedOrders(); } catch (err) { toast(err.message, 'error'); }
+  });
+}
+
+function openFiadoCancel(id) {
+  showModal(`
+    <h3>Anular fiado</h3>
+    <form id="fiaCancelForm">
+      <div class="field"><label>Motivo</label><input id="fiaCancelReason" required /></div>
+      <button class="btn btn-danger btn-block" type="submit">Confirmar anulación</button>
+    </form>
+  `);
+  document.getElementById('fiaCancelForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    try { await api.post('/api/fiados/' + id + '/anular', { reason: document.getElementById('fiaCancelReason').value }); closeModal(); toast('Fiado anulado', 'success'); renderCreditSales(); } catch (err) { toast(err.message, 'error'); }
+  });
 }
 
 // ---------------- INVENTORY LIST ----------------

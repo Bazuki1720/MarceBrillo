@@ -3,9 +3,9 @@ const path = require('path');
 const express = require('express');
 const session = require('express-session');
 const bcrypt = require('bcryptjs');
-const { pool, initSchema } = require('./db');
+const { pool, initSchema, withTransaction } = require('./db');
 const { requireAuth, requireAdmin } = require('./auth');
-const { getOrCreateVariant, recordMovement, createSale, voidSale } = require('./inventoryLogic');
+const { getOrCreateVariant, recordMovement, createSale, voidSale, getAvailableQuantityForVariant } = require('./inventoryLogic');
 const reports = require('./reports');
 
 const app = express();
@@ -142,6 +142,113 @@ async function serializeProduct(product) {
   };
 }
 
+function formatOrderNumber(prefix, count) {
+  return `${prefix}-${String(count + 1).padStart(5, '0')}`;
+}
+
+async function getVariantContext(client, variantId) {
+  const { rows } = await client.query(
+    `SELECT pv.id, pv.product_id, pv.size, p.reference, p.name AS product_name, p.price, p.category_id, p.status
+     FROM product_variants pv
+     JOIN products p ON p.id = pv.product_id
+     WHERE pv.id = $1`,
+    [variantId]
+  );
+  if (!rows[0]) {
+    const error = new Error('VARIANTE_NO_ENCONTRADA');
+    error.code = 'VARIANTE_NO_ENCONTRADA';
+    throw error;
+  }
+  return rows[0];
+}
+
+async function ensureAvailableForVariant(client, variantId, quantity, contextLabel = 'Producto') {
+  const available = await getAvailableQuantityForVariant(client, variantId);
+  if (quantity > available) {
+    const error = new Error(`${contextLabel}: no hay suficientes unidades disponibles. Disponible: ${available}`);
+    error.code = 'STOCK_INSUFICIENTE';
+    error.available = available;
+    throw error;
+  }
+}
+
+async function getSeparatedOrderPayload(client, orderId) {
+  const orderRes = await client.query(
+    `SELECT o.*, u.full_name AS created_by_name,
+            o.customer_name AS client_name,
+            o.customer_phone AS phone,
+            CASE WHEN o.status = 'activo' AND o.due_at < now() THEN TRUE ELSE FALSE END AS is_expired
+     FROM separated_orders o
+     JOIN users u ON u.id = o.user_id
+     WHERE o.id = $1`,
+    [orderId]
+  );
+  const order = orderRes.rows[0];
+  if (!order) return null;
+  const itemsRes = await client.query(
+    `SELECT soi.*, p.reference, p.name AS product_name
+     FROM separated_order_items soi
+     JOIN product_variants pv ON pv.id = soi.variant_id
+     JOIN products p ON p.id = pv.product_id
+     WHERE soi.separated_order_id = $1 ORDER BY soi.id`,
+    [orderId]
+  );
+  const paymentRes = await client.query(
+    `SELECT sp.*, u.full_name AS user_name FROM separated_payments sp JOIN users u ON u.id = sp.user_id WHERE sp.separated_order_id = $1 ORDER BY sp.created_at DESC`,
+    [orderId]
+  );
+  const paidAmount = paymentRes.rows.reduce((sum, item) => sum + Number(item.amount || 0), 0);
+  return {
+    ...order,
+    total: Number(order.total),
+    paid_amount: paidAmount,
+    balance: Number(order.total) - paidAmount,
+    items: itemsRes.rows.map((item) => ({
+      ...item,
+      unit_price: Number(item.unit_price),
+      subtotal: Number(item.subtotal),
+      quantity_withdrawn: Number(item.quantity_withdrawn || 0),
+      retired_quantity: Number(item.quantity_withdrawn || 0),
+    })),
+    payments: paymentRes.rows.map((item) => ({ ...item, amount: Number(item.amount) })),
+  };
+}
+
+async function getCreditSalePayload(client, creditId) {
+  const creditRes = await client.query(
+    `SELECT cs.*, u.full_name AS created_by_name,
+            cs.customer_name AS client_name,
+            cs.customer_phone AS phone
+     FROM credit_sales cs
+     JOIN users u ON u.id = cs.user_id
+     WHERE cs.id = $1`,
+    [creditId]
+  );
+  const credit = creditRes.rows[0];
+  if (!credit) return null;
+  const itemsRes = await client.query(
+    `SELECT csi.*, p.reference, p.name AS product_name
+     FROM credit_sale_items csi
+     JOIN product_variants pv ON pv.id = csi.variant_id
+     JOIN products p ON p.id = pv.product_id
+     WHERE csi.credit_sale_id = $1 ORDER BY csi.id`,
+    [creditId]
+  );
+  const paymentRes = await client.query(
+    `SELECT cp.*, u.full_name AS user_name FROM credit_payments cp JOIN users u ON u.id = cp.user_id WHERE cp.credit_sale_id = $1 ORDER BY cp.created_at DESC`,
+    [creditId]
+  );
+  const paidAmount = paymentRes.rows.reduce((sum, item) => sum + Number(item.amount || 0), 0);
+  return {
+    ...credit,
+    total: Number(credit.total),
+    paid_amount: paidAmount,
+    balance: Number(credit.total) - paidAmount,
+    items: itemsRes.rows.map((item) => ({ ...item, unit_price: Number(item.unit_price), subtotal: Number(item.subtotal) })),
+    payments: paymentRes.rows.map((item) => ({ ...item, amount: Number(item.amount) })),
+  };
+}
+
 app.get('/api/products', requireAuth, h(async (req, res) => {
   const { q } = req.query;
   const params = [];
@@ -183,6 +290,365 @@ app.get('/api/products/:id', requireAuth, h(async (req, res) => {
   const { rows } = await pool.query('SELECT * FROM products WHERE id = $1', [req.params.id]);
   if (!rows[0]) return res.status(404).json({ error: 'Producto no encontrado' });
   res.json(await serializeProduct(rows[0]));
+}));
+
+app.get('/api/separados', requireAuth, h(async (req, res) => {
+  const { q } = req.query;
+  let sql = `
+    SELECT DISTINCT ON (o.id) o.*, u.full_name AS created_by_name,
+      o.customer_name AS client_name,
+      o.customer_phone AS phone,
+      COALESCE((SELECT SUM(sp.amount) FROM separated_payments sp WHERE sp.separated_order_id = o.id), 0)::numeric AS paid_amount,
+      CASE WHEN o.status = 'activo' AND o.due_at < now() THEN TRUE ELSE FALSE END AS is_expired
+    FROM separated_orders o
+    JOIN users u ON u.id = o.user_id
+    LEFT JOIN separated_order_items soi ON soi.separated_order_id = o.id
+  `;
+  const params = [];
+  if (q && q.trim()) {
+    params.push(`%${q.trim()}%`);
+    sql += ` WHERE o.customer_name ILIKE $1 OR o.customer_phone ILIKE $1 OR soi.product_reference ILIKE $1 OR soi.product_name ILIKE $1`;
+  }
+  sql += ' ORDER BY o.id DESC, o.created_at DESC';
+  const { rows } = await pool.query(sql, params);
+  res.json(rows.map((row) => ({
+    ...row,
+    total: Number(row.total),
+    paid_amount: Number(row.paid_amount),
+    balance: Number(row.total) - Number(row.paid_amount || 0),
+  })));
+}));
+
+app.get('/api/separados/:id', requireAuth, h(async (req, res) => {
+  const orderRes = await pool.query(
+    `SELECT o.*, u.full_name AS created_by_name,
+            o.customer_name AS client_name,
+            o.customer_phone AS phone,
+            CASE WHEN o.status = 'activo' AND o.due_at < now() THEN TRUE ELSE FALSE END AS is_expired
+     FROM separated_orders o
+     JOIN users u ON u.id = o.user_id
+     WHERE o.id = $1`,
+    [req.params.id]
+  );
+  const order = orderRes.rows[0];
+  if (!order) return res.status(404).json({ error: 'Separado no encontrado' });
+  const itemsRes = await pool.query('SELECT * FROM separated_order_items WHERE separated_order_id = $1 ORDER BY id', [req.params.id]);
+  const paymentsRes = await pool.query('SELECT * FROM separated_payments WHERE separated_order_id = $1 ORDER BY created_at DESC', [req.params.id]);
+  const paidAmount = paymentsRes.rows.reduce((sum, item) => sum + Number(item.amount || 0), 0);
+  res.json({
+    ...order,
+    total: Number(order.total),
+    paid_amount: paidAmount,
+    balance: Number(order.total) - paidAmount,
+    items: itemsRes.rows.map((item) => ({
+      ...item,
+      unit_price: Number(item.unit_price),
+      subtotal: Number(item.subtotal),
+      retired_quantity: Number(item.quantity_withdrawn || 0),
+    })),
+    payments: paymentsRes.rows.map((item) => ({ ...item, amount: Number(item.amount) })),
+  });
+}));
+
+app.post('/api/separados', requireAuth, h(async (req, res) => {
+  const { clientName, phone, items, initialPayment = 0, dueAt } = req.body || {};
+  if (!clientName || !phone || !Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ error: 'Cliente, teléfono y al menos un producto son obligatorios' });
+  }
+  if (!/^\d{7,15}$/.test(String(phone).replace(/\D/g, ''))) {
+    return res.status(400).json({ error: 'El teléfono no es válido' });
+  }
+  const paymentAmount = Number(initialPayment || 0);
+  if (paymentAmount < 0) return res.status(400).json({ error: 'El abono inicial no puede ser negativo' });
+
+  const result = await withTransaction(async (client) => {
+    let total = 0;
+    const preparedItems = [];
+    for (const item of items) {
+      const qty = Number(item.quantity);
+      if (!qty || qty <= 0) throw Object.assign(new Error('Cantidad inválida en el separado'), { statusCode: 400 });
+      const variant = await getVariantContext(client, Number(item.variantId));
+      await ensureAvailableForVariant(client, variant.id, qty, `${variant.reference}${variant.size ? ' talla ' + variant.size : ''}`);
+      const unitPrice = Number(item.unitPrice ?? variant.price);
+      if (!Number.isFinite(unitPrice) || unitPrice < 0) throw Object.assign(new Error('Precio inválido para el separado'), { statusCode: 400 });
+      const subtotal = qty * unitPrice;
+      total += subtotal;
+      preparedItems.push({
+        variantId: variant.id,
+        quantity: qty,
+        unitPrice,
+        subtotal,
+        productReference: variant.reference,
+        productName: variant.product_name,
+        size: variant.size,
+      });
+    }
+    if (paymentAmount > total) throw Object.assign(new Error('El abono inicial no puede superar el total'), { statusCode: 400 });
+
+    const countRes = await client.query('SELECT COUNT(*)::int AS c FROM separated_orders');
+    const dueDate = dueAt ? new Date(dueAt) : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+    const orderNumber = `SEP-${String(countRes.rows[0].c + 1).padStart(5, '0')}`;
+    const orderRes = await client.query(
+      `INSERT INTO separated_orders (separation_number, customer_name, customer_phone, total, status, due_at, user_id)
+       VALUES ($1, $2, $3, $4, 'activo', $5, $6)
+       RETURNING id`,
+      [orderNumber, clientName.trim(), phone.trim(), total, dueDate.toISOString(), req.session.userId]
+    );
+    const orderId = orderRes.rows[0].id;
+
+    for (const item of preparedItems) {
+      await client.query(
+        `INSERT INTO separated_order_items (separated_order_id, variant_id, product_reference, product_name, size, quantity, quantity_withdrawn, unit_price, subtotal)
+         VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8)`,
+        [orderId, item.variantId, item.productReference, item.productName, item.size || null, item.quantity, item.unitPrice, item.subtotal]
+      );
+    }
+
+    if (paymentAmount > 0) {
+      await client.query(
+        `INSERT INTO separated_payments (separated_order_id, amount, payment_method, user_id, note)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [orderId, paymentAmount, 'efectivo', req.session.userId, 'Abono inicial']
+      );
+    }
+
+    return { orderId, orderNumber, total, paidAmount: paymentAmount, status: 'activo', due_at: dueDate.toISOString() };
+  });
+
+  res.json(result);
+}));
+
+app.post('/api/separados/:id/pagos', requireAuth, h(async (req, res) => {
+  const { amount, method = 'efectivo', note } = req.body || {};
+  const numericAmount = Number(amount);
+  if (!numericAmount || numericAmount <= 0) return res.status(400).json({ error: 'El valor del abono debe ser mayor a cero' });
+  const order = await pool.query('SELECT * FROM separated_orders WHERE id = $1 FOR UPDATE', [req.params.id]);
+  if (!order.rows[0]) return res.status(404).json({ error: 'Separado no encontrado' });
+  const currentPaid = Number((await pool.query(
+    'SELECT COALESCE(SUM(amount), 0)::numeric AS total FROM separated_payments WHERE separated_order_id = $1',
+    [req.params.id]
+  )).rows[0].total || 0);
+  const total = Number(order.rows[0].total || 0);
+  if (numericAmount > total - currentPaid) return res.status(400).json({ error: 'El abono no puede superar el saldo del separado' });
+  const { rows } = await pool.query(
+    `INSERT INTO separated_payments (separated_order_id, amount, payment_method, user_id, note)
+     VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+    [req.params.id, numericAmount, method, req.session.userId, note || null]
+  );
+  res.json({ ok: true, payment: { ...rows[0], amount: Number(rows[0].amount) } });
+}));
+
+app.post('/api/separados/:id/retiro', requireAuth, h(async (req, res) => {
+  const quantityToRetire = Number(req.body?.quantity ?? 0);
+  if (!quantityToRetire || quantityToRetire <= 0) return res.status(400).json({ error: 'La cantidad a retirar debe ser mayor a cero' });
+
+  const result = await withTransaction(async (client) => {
+    const orderRes = await client.query('SELECT * FROM separated_orders WHERE id = $1 FOR UPDATE', [req.params.id]);
+    const order = orderRes.rows[0];
+    if (!order) throw Object.assign(new Error('Separado no encontrado'), { statusCode: 404 });
+    if (order.status === 'anulado') throw Object.assign(new Error('El separado ya está anulado'), { statusCode: 400 });
+    const itemsRes = await client.query('SELECT * FROM separated_order_items WHERE separated_order_id = $1 ORDER BY id', [order.id]);
+    let remaining = quantityToRetire;
+    for (const item of itemsRes) {
+      const availableToRetire = item.quantity - item.quantity_withdrawn;
+      if (availableToRetire <= 0) continue;
+      const toRetire = Math.min(remaining, availableToRetire);
+      await recordMovement(client, {
+        variantId: item.variant_id,
+        type: 'ajuste',
+        quantityChange: -toRetire,
+        reason: `Retiro separado ${order.separation_number}`,
+        userId: req.session.userId,
+      });
+      await client.query('UPDATE separated_order_items SET quantity_withdrawn = quantity_withdrawn + $1 WHERE id = $2', [toRetire, item.id]);
+      remaining -= toRetire;
+      if (remaining <= 0) break;
+    }
+    if (remaining > 0) throw Object.assign(new Error('No se puede retirar más de lo pendiente en el separado'), { statusCode: 400 });
+    const pendingRes = await client.query(
+      `SELECT COALESCE(SUM(quantity - quantity_withdrawn), 0)::int AS pending FROM separated_order_items WHERE separated_order_id = $1`,
+      [order.id]
+    );
+    const pending = Number(pendingRes.rows[0].pending || 0);
+    if (pending <= 0) await client.query("UPDATE separated_orders SET status = 'completado', completed_at = now() WHERE id = $1", [order.id]);
+    return { ok: true, remaining: pending };
+  });
+
+  res.json(result);
+}));
+
+app.post('/api/separados/:id/anular', requireAuth, h(async (req, res) => {
+  const { reason } = req.body || {};
+  const orderRes = await pool.query('SELECT * FROM separated_orders WHERE id = $1 FOR UPDATE', [req.params.id]);
+  if (!orderRes.rows[0]) return res.status(404).json({ error: 'Separado no encontrado' });
+  if (orderRes.rows[0].status === 'anulado') return res.status(400).json({ error: 'Este separado ya está anulado' });
+  await pool.query(
+    `UPDATE separated_orders SET status = 'anulado', voided_at = now(), voided_by = $1, void_reason = $2 WHERE id = $3`,
+    [req.session.userId, reason || null, req.params.id]
+  );
+  res.json({ ok: true });
+}));
+
+app.get('/api/fiados', requireAuth, h(async (req, res) => {
+  const { q } = req.query;
+  let sql = `
+    SELECT DISTINCT ON (cs.id) cs.*, u.full_name AS created_by_name,
+      cs.customer_name AS client_name,
+      cs.customer_phone AS phone,
+      COALESCE((SELECT SUM(cp.amount) FROM credit_payments cp WHERE cp.credit_sale_id = cs.id), 0)::numeric AS paid_amount
+    FROM credit_sales cs
+    JOIN users u ON u.id = cs.user_id
+    LEFT JOIN credit_sale_items csi ON csi.credit_sale_id = cs.id
+  `;
+  const params = [];
+  if (q && q.trim()) {
+    params.push(`%${q.trim()}%`);
+    sql += ` WHERE cs.customer_name ILIKE $1 OR cs.customer_phone ILIKE $1 OR csi.product_reference ILIKE $1 OR csi.product_name ILIKE $1`;
+  }
+  sql += ' ORDER BY cs.id DESC, cs.created_at DESC';
+  const { rows } = await pool.query(sql, params);
+  res.json(rows.map((row) => ({
+    ...row,
+    total: Number(row.total),
+    paid_amount: Number(row.paid_amount),
+    balance: Number(row.total) - Number(row.paid_amount || 0),
+  })));
+}));
+
+app.get('/api/fiados/:id', requireAuth, h(async (req, res) => {
+  const creditRes = await pool.query(
+    `SELECT cs.*, u.full_name AS created_by_name,
+            cs.customer_name AS client_name,
+            cs.customer_phone AS phone
+     FROM credit_sales cs
+     JOIN users u ON u.id = cs.user_id
+     WHERE cs.id = $1`,
+    [req.params.id]
+  );
+  const credit = creditRes.rows[0];
+  if (!credit) return res.status(404).json({ error: 'Fiado no encontrado' });
+  const itemsRes = await pool.query('SELECT * FROM credit_sale_items WHERE credit_sale_id = $1 ORDER BY id', [req.params.id]);
+  const paymentsRes = await pool.query('SELECT * FROM credit_payments WHERE credit_sale_id = $1 ORDER BY created_at DESC', [req.params.id]);
+  const paidAmount = paymentsRes.rows.reduce((sum, item) => sum + Number(item.amount || 0), 0);
+  res.json({
+    ...credit,
+    total: Number(credit.total),
+    paid_amount: paidAmount,
+    balance: Number(credit.total) - paidAmount,
+    items: itemsRes.rows.map((item) => ({ ...item, unit_price: Number(item.unit_price), subtotal: Number(item.subtotal) })),
+    payments: paymentsRes.rows.map((item) => ({ ...item, amount: Number(item.amount) })),
+  });
+}));
+
+app.post('/api/fiados', requireAuth, h(async (req, res) => {
+  const { clientName, phone, items, initialPayment = 0 } = req.body || {};
+  if (!clientName || !phone || !Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ error: 'Cliente, teléfono y al menos un producto son obligatorios' });
+  }
+  if (!/^\d{7,15}$/.test(String(phone).replace(/\D/g, ''))) {
+    return res.status(400).json({ error: 'El teléfono no es válido' });
+  }
+  const paymentAmount = Number(initialPayment || 0);
+  if (paymentAmount < 0) return res.status(400).json({ error: 'El abono inicial no puede ser negativo' });
+
+  const result = await withTransaction(async (client) => {
+    let total = 0;
+    const preparedItems = [];
+    for (const item of items) {
+      const qty = Number(item.quantity);
+      const unitPrice = Number(item.unitPrice ?? 0);
+      if (!qty || qty <= 0 || !Number.isFinite(unitPrice) || unitPrice < 0) {
+        throw Object.assign(new Error('Producto o precio inválido en el fiado'), { statusCode: 400 });
+      }
+      const variant = await getVariantContext(client, Number(item.variantId));
+      await ensureAvailableForVariant(client, variant.id, qty, `${variant.reference}${variant.size ? ' talla ' + variant.size : ''}`);
+      total += qty * unitPrice;
+      preparedItems.push({
+        variantId: variant.id,
+        quantity: qty,
+        unitPrice,
+        subtotal: qty * unitPrice,
+        productReference: variant.reference,
+        productName: variant.product_name,
+        size: variant.size,
+      });
+    }
+    if (paymentAmount > total) throw Object.assign(new Error('El abono inicial no puede superar el total del fiado'), { statusCode: 400 });
+
+    const countRes = await client.query('SELECT COUNT(*)::int AS c FROM credit_sales');
+    const creditNumber = `FIA-${String(countRes.rows[0].c + 1).padStart(5, '0')}`;
+    const creditRes = await client.query(
+      `INSERT INTO credit_sales (credit_number, customer_name, customer_phone, total, status, user_id)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING id`,
+      [creditNumber, clientName.trim(), phone.trim(), total, paymentAmount >= total ? 'pagado' : 'pendiente', req.session.userId]
+    );
+    const creditId = creditRes.rows[0].id;
+
+    for (const item of preparedItems) {
+      await client.query(
+        `INSERT INTO credit_sale_items (credit_sale_id, variant_id, product_reference, product_name, size, quantity, unit_price, subtotal)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [creditId, item.variantId, item.productReference, item.productName, item.size || null, item.quantity, item.unitPrice, item.subtotal]
+      );
+      await recordMovement(client, {
+        variantId: item.variantId,
+        type: 'venta',
+        quantityChange: -item.quantity,
+        reason: `Fiado ${creditNumber}`,
+        userId: req.session.userId,
+      });
+    }
+
+    if (paymentAmount > 0) {
+      await client.query(
+        `INSERT INTO credit_payments (credit_sale_id, amount, payment_method, user_id, note)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [creditId, paymentAmount, 'efectivo', req.session.userId, 'Abono inicial']
+      );
+    }
+
+    return { creditId, creditNumber, total, paidAmount: paymentAmount, status: paymentAmount >= total ? 'pagado' : 'pendiente' };
+  });
+
+  res.json(result);
+}));
+
+app.post('/api/fiados/:id/pagos', requireAuth, h(async (req, res) => {
+  const { amount, method = 'efectivo', note } = req.body || {};
+  const numericAmount = Number(amount);
+  if (!numericAmount || numericAmount <= 0) return res.status(400).json({ error: 'El valor del abono debe ser mayor a cero' });
+  const credit = await pool.query('SELECT * FROM credit_sales WHERE id = $1 FOR UPDATE', [req.params.id]);
+  if (!credit.rows[0]) return res.status(404).json({ error: 'Fiado no encontrado' });
+  if (credit.rows[0].status === 'anulado') return res.status(400).json({ error: 'Este fiado está anulado' });
+  const currentPaid = Number((await pool.query(
+    'SELECT COALESCE(SUM(amount), 0)::numeric AS total FROM credit_payments WHERE credit_sale_id = $1',
+    [req.params.id]
+  )).rows[0].total || 0);
+  const total = Number(credit.rows[0].total || 0);
+  if (numericAmount > total - currentPaid) return res.status(400).json({ error: 'El abono no puede superar el saldo pendiente' });
+  const { rows } = await pool.query(
+    `INSERT INTO credit_payments (credit_sale_id, amount, payment_method, user_id, note) VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+    [req.params.id, numericAmount, method, req.session.userId, note || null]
+  );
+  const newPaid = currentPaid + numericAmount;
+  await pool.query(
+    `UPDATE credit_sales SET status = CASE WHEN $1 >= total THEN 'pagado' ELSE 'pendiente' END, paid_at = CASE WHEN $1 >= total THEN now() ELSE paid_at END WHERE id = $2`,
+    [newPaid, req.params.id]
+  );
+  res.json({ ok: true, payment: { ...rows[0], amount: Number(rows[0].amount) } });
+}));
+
+app.post('/api/fiados/:id/anular', requireAuth, h(async (req, res) => {
+  const { reason } = req.body || {};
+  const credit = await pool.query('SELECT * FROM credit_sales WHERE id = $1 FOR UPDATE', [req.params.id]);
+  if (!credit.rows[0]) return res.status(404).json({ error: 'Fiado no encontrado' });
+  if (credit.rows[0].status === 'anulado') return res.status(400).json({ error: 'Este fiado ya está anulado' });
+  await pool.query(
+    `UPDATE credit_sales SET status = 'anulado', voided_at = now(), voided_by = $1, void_reason = $2 WHERE id = $3`,
+    [req.session.userId, reason || null, req.params.id]
+  );
+  res.json({ ok: true });
 }));
 
 app.post('/api/products', requireAuth, h(async (req, res) => {
@@ -443,40 +909,31 @@ app.post('/api/sales', requireAuth, h(async (req, res) => {
   }
 
   const preparedItems = [];
-  for (const it of items) {
-    const variantRes = await pool.query(
-      `SELECT pv.*, p.reference, p.name as product_name, p.price, p.status, p.category_id
-       FROM product_variants pv JOIN products p ON p.id = pv.product_id
-       WHERE pv.id = $1`,
-      [it.variantId]
-    );
-    const variant = variantRes.rows[0];
-    if (!variant) return res.status(404).json({ error: `Variante no encontrada (id ${it.variantId})` });
-    const qty = Number(it.quantity);
-    if (!qty || qty <= 0) return res.status(400).json({ error: 'Cantidad inválida en el carrito' });
-    const invRes = await pool.query('SELECT quantity FROM inventory WHERE variant_id = $1', [variant.id]);
-    const available = invRes.rows[0] ? invRes.rows[0].quantity : 0;
-    if (qty > available) {
-      return res.status(400).json({
-        error: `No hay suficientes unidades de ${variant.reference}${variant.size ? ' talla ' + variant.size : ''}. Disponible: ${available}`,
-      });
-    }
-    preparedItems.push({
-      variantId: variant.id,
-      quantity: qty,
-      unitPrice: Number(variant.price),
-      productReference: variant.reference,
-      productName: variant.product_name,
-      categoryId: variant.category_id,
-      size: variant.size,
-    });
-  }
-
+  const { withTransaction } = require('./db');
   try {
+    await withTransaction(async (client) => {
+      for (const it of items) {
+        const variant = await getVariantContext(client, Number(it.variantId));
+        const qty = Number(it.quantity);
+        if (!qty || qty <= 0) throw Object.assign(new Error('Cantidad inválida en el carrito'), { statusCode: 400 });
+        await ensureAvailableForVariant(client, variant.id, qty, `${variant.reference}${variant.size ? ' talla ' + variant.size : ''}`);
+        preparedItems.push({
+          variantId: variant.id,
+          quantity: qty,
+          unitPrice: Number(variant.price),
+          productReference: variant.reference,
+          productName: variant.product_name,
+          categoryId: variant.category_id,
+          size: variant.size,
+        });
+      }
+    });
     const result = await createSale(preparedItems, req.session.userId, paymentMethod, paymentDestination);
     res.json(result);
   } catch (e) {
     if (e.code === 'STOCK_INSUFICIENTE') return res.status(400).json({ error: `Stock insuficiente. Disponible: ${e.available}` });
+    if (e.statusCode === 400) return res.status(400).json({ error: e.message });
+    if (e.code === 'VARIANTE_NO_ENCONTRADA') return res.status(404).json({ error: `Variante no encontrada (id ${req.body.items[0]?.variantId})` });
     res.status(500).json({ error: 'Error registrando la venta: ' + e.message });
   }
 }));
@@ -520,7 +977,7 @@ app.post('/api/sales/:id/void', requireAuth, h(async (req, res) => {
 app.get('/api/dashboard', requireAuth, h(async (req, res) => {
   const today = new Date().toISOString().slice(0, 10);
   const t = await reports.totals(today, today);
-  const [lowStock, inventoryTotal] = await Promise.all([
+  const [lowStock, inventoryTotal, expiredSeparated] = await Promise.all([
     pool.query(
     `SELECT COUNT(*)::int as c FROM (
        SELECT p.id, COALESCE(SUM(i.quantity),0) as total_stock
@@ -531,6 +988,7 @@ app.get('/api/dashboard', requireAuth, h(async (req, res) => {
      ) x`
     ),
     pool.query('SELECT COALESCE(SUM(quantity), 0)::int AS total_units FROM inventory'),
+    pool.query("SELECT COUNT(*)::int AS c FROM separated_orders WHERE status = 'activo' AND due_at < now()"),
   ]);
   res.json({
     salesToday: t.revenue,
@@ -538,6 +996,7 @@ app.get('/api/dashboard', requireAuth, h(async (req, res) => {
     itemsSoldToday: t.itemsSold,
     lowStockCount: lowStock.rows[0].c,
     inventoryUnits: inventoryTotal.rows[0].total_units,
+    expiredSeparatedCount: expiredSeparated.rows[0].c,
   });
 }));
 

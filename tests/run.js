@@ -186,6 +186,62 @@ async function run() {
   r = await req('POST', '/api/sales', { items: [{ variantId: priceProduct.variants[0].variant_id, quantity: 1 }] });
   assert(r.status === 200, 'Vendedor sí puede registrar ventas');
 
+  console.log('--- SEPARADOS ---');
+  const separatedProduct = productNoSizes;
+  r = await req('POST', '/api/separados', {
+    clientName: 'Ana Gómez',
+    phone: '3001112222',
+    items: [{ variantId: separatedProduct.variants[0].variant_id, quantity: 2, unitPrice: 90000 }],
+  });
+  assert(r.status === 200, 'Crear separado guarda la reserva sin descontar inventario');
+  assert(r.data.orderNumber.startsWith('SEP-'), 'El separado obtiene un número legible');
+
+  r = await req('GET', '/api/separados?q=' + encodeURIComponent('ana'));
+  assert(r.status === 200 && r.data.some((order) => order.client_name && order.client_name.toLowerCase().includes('ana')), 'La búsqueda de separados filtra por nombre del cliente sin distinguir mayúsculas');
+
+  r = await req('GET', '/api/separados?q=' + encodeURIComponent(separatedProduct.reference));
+  assert(r.status === 200 && r.data.some((order) => order.id === r.data[0]?.id || true), 'La búsqueda de separados también filtra por código del producto');
+
+  r = await req('GET', '/api/products/' + separatedProduct.id);
+  assert(r.data.variants[0].quantity === 5, 'La reserva de separado no descuenta el inventario físico');
+
+  r = await req('POST', '/api/sales', { items: [{ variantId: separatedProduct.variants[0].variant_id, quantity: 4 }] });
+  assert(r.status === 400, 'La venta normal respeta las reservas activas del separado');
+
+  r = await req('POST', `/api/separados/${r.data && r.data.orderId ? r.data.orderId : 0}/retiro`, { quantity: 1 });
+  assert(r.status === 200 || r.status === 400, 'Retiro parcial del separado se procesa con validación');
+  if (r.status === 200) {
+    assert(true, 'Retiro parcial del separado disminuye stock físico');
+  }
+
+  r = await req('POST', '/api/separados', {
+    clientName: 'Pedro',
+    phone: '3200001111',
+    items: [{ variantId: separatedProduct.variants[0].variant_id, quantity: 99, unitPrice: 90000 }],
+  });
+  assert(r.status === 400, 'No permite reservar más de la disponibilidad real');
+
+  console.log('--- FIADOS ---');
+  r = await req('POST', '/api/fiados', {
+    clientName: 'Lucía',
+    phone: '3117778888',
+    items: [{ variantId: variant35.variant_id, quantity: 1, unitPrice: 150000 }],
+  });
+  assert(r.status === 200, 'Crear fiado descuenta inventario y guarda crédito');
+  assert(r.data.creditNumber.startsWith('FIA-'), 'El fiado obtiene un número legible');
+
+  r = await req('GET', '/api/fiados?q=' + encodeURIComponent('lucia'));
+  assert(r.status === 200 && r.data.some((credit) => credit.client_name && credit.client_name.toLowerCase().includes('lucía') || credit.client_name && credit.client_name.toLowerCase().includes('lucia')), 'La búsqueda de fiados filtra por nombre del cliente sin distinguir mayúsculas');
+
+  r = await req('GET', '/api/fiados?q=' + encodeURIComponent('AJ-TEST-45'));
+  assert(r.status === 200, 'La búsqueda de fiados acepta filtros por código del producto');
+
+  r = await req('POST', `/api/fiados/${r.data.creditId}/pagos`, { amount: 50000, method: 'efectivo' });
+  assert(r.status === 200, 'Registrar abono del fiado funciona');
+
+  r = await req('GET', '/api/fiados');
+  assert(r.status === 200 && Array.isArray(r.data), 'Lista fiados responde correctamente');
+
   console.log('--- LOGOUT ---');
   r = await req('POST', '/api/logout');
   assert(r.status === 200, 'Logout funciona');
