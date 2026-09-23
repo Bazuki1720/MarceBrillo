@@ -123,13 +123,24 @@ async function voidSale(saleId, userId, reason) {
 }
 
 async function getReservedQuantityForVariant(client, variantId) {
-  const { rows } = await client.query(
-    `SELECT COALESCE(SUM(soi.quantity - soi.quantity_withdrawn), 0)::int AS reserved
-     FROM separated_order_items soi
-     JOIN separated_orders so ON so.id = soi.separated_order_id
-     WHERE soi.variant_id = $1 AND so.status = 'activo'`,
-    [variantId]
+  const { rows: schemaRows } = await client.query(
+    `SELECT column_name
+     FROM information_schema.columns
+     WHERE table_name IN ('separated_orders', 'separated_order_items')
+     ORDER BY table_name, ordinal_position`
   );
+  const columns = new Set(schemaRows.map((row) => row.column_name));
+  const useModernSeparatedSchema = columns.has('separation_number') && columns.has('quantity_withdrawn');
+  const query = useModernSeparatedSchema
+    ? `SELECT COALESCE(SUM(soi.quantity - soi.quantity_withdrawn), 0)::int AS reserved
+       FROM separated_order_items soi
+       JOIN separated_orders so ON so.id = soi.separated_order_id
+       WHERE soi.variant_id = $1 AND so.status = 'activo'`
+    : `SELECT COALESCE(SUM(soi.quantity - soi.retired_quantity), 0)::int AS reserved
+       FROM separated_order_items soi
+       JOIN separated_orders so ON so.id = soi.order_id
+       WHERE soi.variant_id = $1 AND so.status = 'activo'`;
+  const { rows } = await client.query(query, [variantId]);
   return Number(rows[0]?.reserved || 0);
 }
 

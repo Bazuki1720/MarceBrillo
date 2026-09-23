@@ -162,6 +162,19 @@ async function getVariantContext(client, variantId) {
   return rows[0];
 }
 
+async function getSeparatedSchemaInfo(client = pool) {
+  const { rows } = await client.query(`
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_name IN ('separated_orders', 'separated_order_items', 'separated_payments')
+  `);
+  const columns = new Set(rows.map((row) => row.column_name));
+  return {
+    modern: columns.has('separation_number') && columns.has('customer_name') && columns.has('customer_phone') && columns.has('user_id') && columns.has('quantity_withdrawn'),
+    columns,
+  };
+}
+
 async function ensureAvailableForVariant(client, variantId, quantity, contextLabel = 'Producto') {
   const available = await getAvailableQuantityForVariant(client, variantId);
   if (quantity > available) {
@@ -294,7 +307,8 @@ app.get('/api/products/:id', requireAuth, h(async (req, res) => {
 
 app.get('/api/separados', requireAuth, h(async (req, res) => {
   const { q } = req.query;
-  let sql = `
+  const { modern } = await getSeparatedSchemaInfo();
+  let sql = modern ? `
     SELECT DISTINCT ON (o.id) o.*, u.full_name AS created_by_name,
       o.customer_name AS client_name,
       o.customer_phone AS phone,
@@ -303,11 +317,22 @@ app.get('/api/separados', requireAuth, h(async (req, res) => {
     FROM separated_orders o
     JOIN users u ON u.id = o.user_id
     LEFT JOIN separated_order_items soi ON soi.separated_order_id = o.id
+  ` : `
+    SELECT DISTINCT ON (o.id) o.*, u.full_name AS created_by_name,
+      o.client_name AS client_name,
+      o.phone AS phone,
+      COALESCE((SELECT SUM(sp.amount) FROM separated_payments sp WHERE sp.order_id = o.id), 0)::numeric AS paid_amount,
+      CASE WHEN o.status = 'activo' AND o.due_at < now() THEN TRUE ELSE FALSE END AS is_expired
+    FROM separated_orders o
+    JOIN users u ON u.id = o.created_by
+    LEFT JOIN separated_order_items soi ON soi.order_id = o.id
   `;
   const params = [];
   if (q && q.trim()) {
     params.push(`%${q.trim()}%`);
-    sql += ` WHERE o.customer_name ILIKE $1 OR o.customer_phone ILIKE $1 OR soi.product_reference ILIKE $1 OR soi.product_name ILIKE $1`;
+    sql += modern
+      ? ` WHERE o.customer_name ILIKE $1 OR o.customer_phone ILIKE $1 OR soi.product_reference ILIKE $1 OR soi.product_name ILIKE $1`
+      : ` WHERE o.client_name ILIKE $1 OR o.phone ILIKE $1 OR soi.product_reference ILIKE $1 OR soi.product_name ILIKE $1`;
   }
   sql += ' ORDER BY o.id DESC, o.created_at DESC';
   const { rows } = await pool.query(sql, params);
@@ -320,20 +345,33 @@ app.get('/api/separados', requireAuth, h(async (req, res) => {
 }));
 
 app.get('/api/separados/:id', requireAuth, h(async (req, res) => {
+  const { modern } = await getSeparatedSchemaInfo();
   const orderRes = await pool.query(
-    `SELECT o.*, u.full_name AS created_by_name,
+    modern ? `SELECT o.*, u.full_name AS created_by_name,
             o.customer_name AS client_name,
             o.customer_phone AS phone,
             CASE WHEN o.status = 'activo' AND o.due_at < now() THEN TRUE ELSE FALSE END AS is_expired
      FROM separated_orders o
      JOIN users u ON u.id = o.user_id
+     WHERE o.id = $1` : `SELECT o.*, u.full_name AS created_by_name,
+            o.client_name AS client_name,
+            o.phone AS phone,
+            CASE WHEN o.status = 'activo' AND o.due_at < now() THEN TRUE ELSE FALSE END AS is_expired
+     FROM separated_orders o
+     JOIN users u ON u.id = o.created_by
      WHERE o.id = $1`,
     [req.params.id]
   );
   const order = orderRes.rows[0];
   if (!order) return res.status(404).json({ error: 'Separado no encontrado' });
-  const itemsRes = await pool.query('SELECT * FROM separated_order_items WHERE separated_order_id = $1 ORDER BY id', [req.params.id]);
-  const paymentsRes = await pool.query('SELECT * FROM separated_payments WHERE separated_order_id = $1 ORDER BY created_at DESC', [req.params.id]);
+  const itemsRes = await pool.query(
+    modern ? 'SELECT * FROM separated_order_items WHERE separated_order_id = $1 ORDER BY id' : 'SELECT * FROM separated_order_items WHERE order_id = $1 ORDER BY id',
+    [req.params.id]
+  );
+  const paymentsRes = await pool.query(
+    modern ? 'SELECT * FROM separated_payments WHERE separated_order_id = $1 ORDER BY created_at DESC' : 'SELECT * FROM separated_payments WHERE order_id = $1 ORDER BY created_at DESC',
+    [req.params.id]
+  );
   const paidAmount = paymentsRes.rows.reduce((sum, item) => sum + Number(item.amount || 0), 0);
   res.json({
     ...order,
@@ -344,7 +382,7 @@ app.get('/api/separados/:id', requireAuth, h(async (req, res) => {
       ...item,
       unit_price: Number(item.unit_price),
       subtotal: Number(item.subtotal),
-      retired_quantity: Number(item.quantity_withdrawn || 0),
+      retired_quantity: Number((modern ? item.quantity_withdrawn : item.retired_quantity) || 0),
     })),
     payments: paymentsRes.rows.map((item) => ({ ...item, amount: Number(item.amount) })),
   });
@@ -360,6 +398,15 @@ app.post('/api/separados', requireAuth, h(async (req, res) => {
   }
   const paymentAmount = Number(initialPayment || 0);
   if (paymentAmount < 0) return res.status(400).json({ error: 'El abono inicial no puede ser negativo' });
+
+  const schemaRows = await pool.query(
+    `SELECT column_name
+     FROM information_schema.columns
+     WHERE table_name IN ('separated_orders', 'separated_order_items', 'separated_payments')
+     ORDER BY table_name, ordinal_position`
+  );
+  const schemaColumns = new Set(schemaRows.rows.map((row) => row.column_name));
+  const useModernSeparatedSchema = schemaColumns.has('separation_number') && schemaColumns.has('quantity_withdrawn');
 
   const result = await withTransaction(async (client) => {
     let total = 0;
@@ -388,28 +435,48 @@ app.post('/api/separados', requireAuth, h(async (req, res) => {
     const countRes = await client.query('SELECT COUNT(*)::int AS c FROM separated_orders');
     const dueDate = dueAt ? new Date(dueAt) : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
     const orderNumber = `SEP-${String(countRes.rows[0].c + 1).padStart(5, '0')}`;
-    const orderRes = await client.query(
-      `INSERT INTO separated_orders (separation_number, customer_name, customer_phone, total, status, due_at, user_id)
-       VALUES ($1, $2, $3, $4, 'activo', $5, $6)
-       RETURNING id`,
-      [orderNumber, clientName.trim(), phone.trim(), total, dueDate.toISOString(), req.session.userId]
-    );
+
+    const orderQuery = useModernSeparatedSchema
+      ? `INSERT INTO separated_orders (separation_number, customer_name, customer_phone, total, status, due_at, user_id)
+         VALUES ($1, $2, $3, $4, 'activo', $5, $6)
+         RETURNING id`
+      : `INSERT INTO separated_orders (order_number, client_name, phone, total, status, due_at, created_by)
+         VALUES ($1, $2, $3, $4, 'activo', $5, $6)
+         RETURNING id`;
+
+    const orderValues = useModernSeparatedSchema
+      ? [orderNumber, clientName.trim(), phone.trim(), total, dueDate.toISOString(), req.session.userId]
+      : [orderNumber, clientName.trim(), phone.trim(), total, dueDate.toISOString(), req.session.userId];
+
+    const orderRes = await client.query(orderQuery, orderValues);
     const orderId = orderRes.rows[0].id;
 
     for (const item of preparedItems) {
-      await client.query(
-        `INSERT INTO separated_order_items (separated_order_id, variant_id, product_reference, product_name, size, quantity, quantity_withdrawn, unit_price, subtotal)
-         VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8)`,
-        [orderId, item.variantId, item.productReference, item.productName, item.size || null, item.quantity, item.unitPrice, item.subtotal]
-      );
+      const itemQuery = useModernSeparatedSchema
+        ? `INSERT INTO separated_order_items (separated_order_id, variant_id, product_reference, product_name, size, quantity, quantity_withdrawn, unit_price, subtotal)
+           VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8)`
+        : `INSERT INTO separated_order_items (order_id, variant_id, product_reference, product_name, size, quantity, retired_quantity, unit_price, subtotal)
+           VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8)`;
+
+      await client.query(itemQuery, [
+        orderId,
+        item.variantId,
+        item.productReference,
+        item.productName,
+        item.size || null,
+        item.quantity,
+        item.unitPrice,
+        item.subtotal,
+      ]);
     }
 
     if (paymentAmount > 0) {
-      await client.query(
-        `INSERT INTO separated_payments (separated_order_id, amount, payment_method, user_id, note)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [orderId, paymentAmount, 'efectivo', req.session.userId, 'Abono inicial']
-      );
+      const paymentQuery = useModernSeparatedSchema
+        ? `INSERT INTO separated_payments (separated_order_id, amount, payment_method, user_id, note)
+           VALUES ($1, $2, $3, $4, $5)`
+        : `INSERT INTO separated_payments (order_id, amount, payment_method, user_id, note)
+           VALUES ($1, $2, $3, $4, $5)`;
+      await client.query(paymentQuery, [orderId, paymentAmount, 'efectivo', req.session.userId, 'Abono inicial']);
     }
 
     return { orderId, orderNumber, total, paidAmount: paymentAmount, status: 'activo', due_at: dueDate.toISOString() };
@@ -422,19 +489,28 @@ app.post('/api/separados/:id/pagos', requireAuth, h(async (req, res) => {
   const { amount, method = 'efectivo', note } = req.body || {};
   const numericAmount = Number(amount);
   if (!numericAmount || numericAmount <= 0) return res.status(400).json({ error: 'El valor del abono debe ser mayor a cero' });
+  const { modern } = await getSeparatedSchemaInfo();
   const order = await pool.query('SELECT * FROM separated_orders WHERE id = $1 FOR UPDATE', [req.params.id]);
   if (!order.rows[0]) return res.status(404).json({ error: 'Separado no encontrado' });
   const currentPaid = Number((await pool.query(
-    'SELECT COALESCE(SUM(amount), 0)::numeric AS total FROM separated_payments WHERE separated_order_id = $1',
+    modern
+      ? 'SELECT COALESCE(SUM(amount), 0)::numeric AS total FROM separated_payments WHERE separated_order_id = $1'
+      : 'SELECT COALESCE(SUM(amount), 0)::numeric AS total FROM separated_payments WHERE order_id = $1',
     [req.params.id]
   )).rows[0].total || 0);
   const total = Number(order.rows[0].total || 0);
   if (numericAmount > total - currentPaid) return res.status(400).json({ error: 'El abono no puede superar el saldo del separado' });
   const { rows } = await pool.query(
-    `INSERT INTO separated_payments (separated_order_id, amount, payment_method, user_id, note)
-     VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+    modern
+      ? `INSERT INTO separated_payments (separated_order_id, amount, payment_method, user_id, note)
+         VALUES ($1, $2, $3, $4, $5) RETURNING *`
+      : `INSERT INTO separated_payments (order_id, amount, payment_method, user_id, note)
+         VALUES ($1, $2, $3, $4, $5) RETURNING *`,
     [req.params.id, numericAmount, method, req.session.userId, note || null]
   );
+  if (!modern) {
+    await pool.query('UPDATE separated_orders SET paid_amount = paid_amount + $1 WHERE id = $2', [numericAmount, req.params.id]);
+  }
   res.json({ ok: true, payment: { ...rows[0], amount: Number(rows[0].amount) } });
 }));
 
@@ -443,34 +519,50 @@ app.post('/api/separados/:id/retiro', requireAuth, h(async (req, res) => {
   if (!quantityToRetire || quantityToRetire <= 0) return res.status(400).json({ error: 'La cantidad a retirar debe ser mayor a cero' });
 
   const result = await withTransaction(async (client) => {
+    const { modern } = await getSeparatedSchemaInfo(client);
     const orderRes = await client.query('SELECT * FROM separated_orders WHERE id = $1 FOR UPDATE', [req.params.id]);
     const order = orderRes.rows[0];
     if (!order) throw Object.assign(new Error('Separado no encontrado'), { statusCode: 404 });
     if (order.status === 'anulado') throw Object.assign(new Error('El separado ya está anulado'), { statusCode: 400 });
-    const itemsRes = await client.query('SELECT * FROM separated_order_items WHERE separated_order_id = $1 ORDER BY id', [order.id]);
+    const itemsRes = await client.query(
+      modern ? 'SELECT * FROM separated_order_items WHERE separated_order_id = $1 ORDER BY id' : 'SELECT * FROM separated_order_items WHERE order_id = $1 ORDER BY id',
+      [order.id]
+    );
     let remaining = quantityToRetire;
     for (const item of itemsRes) {
-      const availableToRetire = item.quantity - item.quantity_withdrawn;
+      const availableToRetire = Number((modern ? item.quantity - item.quantity_withdrawn : item.quantity - item.retired_quantity) || 0);
       if (availableToRetire <= 0) continue;
       const toRetire = Math.min(remaining, availableToRetire);
       await recordMovement(client, {
         variantId: item.variant_id,
         type: 'ajuste',
         quantityChange: -toRetire,
-        reason: `Retiro separado ${order.separation_number}`,
+        reason: `Retiro separado ${modern ? order.separation_number : order.order_number}`,
         userId: req.session.userId,
       });
-      await client.query('UPDATE separated_order_items SET quantity_withdrawn = quantity_withdrawn + $1 WHERE id = $2', [toRetire, item.id]);
+      await client.query(
+        modern
+          ? 'UPDATE separated_order_items SET quantity_withdrawn = quantity_withdrawn + $1 WHERE id = $2'
+          : 'UPDATE separated_order_items SET retired_quantity = retired_quantity + $1 WHERE id = $2',
+        [toRetire, item.id]
+      );
       remaining -= toRetire;
       if (remaining <= 0) break;
     }
     if (remaining > 0) throw Object.assign(new Error('No se puede retirar más de lo pendiente en el separado'), { statusCode: 400 });
     const pendingRes = await client.query(
-      `SELECT COALESCE(SUM(quantity - quantity_withdrawn), 0)::int AS pending FROM separated_order_items WHERE separated_order_id = $1`,
+      modern
+        ? `SELECT COALESCE(SUM(quantity - quantity_withdrawn), 0)::int AS pending FROM separated_order_items WHERE separated_order_id = $1`
+        : `SELECT COALESCE(SUM(quantity - retired_quantity), 0)::int AS pending FROM separated_order_items WHERE order_id = $1`,
       [order.id]
     );
     const pending = Number(pendingRes.rows[0].pending || 0);
-    if (pending <= 0) await client.query("UPDATE separated_orders SET status = 'completado', completed_at = now() WHERE id = $1", [order.id]);
+    if (pending <= 0) {
+      await client.query(
+        modern ? "UPDATE separated_orders SET status = 'completado', completed_at = now() WHERE id = $1" : "UPDATE separated_orders SET status = 'completado' WHERE id = $1",
+        [order.id]
+      );
+    }
     return { ok: true, remaining: pending };
   });
 
@@ -479,11 +571,14 @@ app.post('/api/separados/:id/retiro', requireAuth, h(async (req, res) => {
 
 app.post('/api/separados/:id/anular', requireAuth, h(async (req, res) => {
   const { reason } = req.body || {};
+  const { modern } = await getSeparatedSchemaInfo();
   const orderRes = await pool.query('SELECT * FROM separated_orders WHERE id = $1 FOR UPDATE', [req.params.id]);
   if (!orderRes.rows[0]) return res.status(404).json({ error: 'Separado no encontrado' });
   if (orderRes.rows[0].status === 'anulado') return res.status(400).json({ error: 'Este separado ya está anulado' });
   await pool.query(
-    `UPDATE separated_orders SET status = 'anulado', voided_at = now(), voided_by = $1, void_reason = $2 WHERE id = $3`,
+    modern
+      ? `UPDATE separated_orders SET status = 'anulado', voided_at = now(), voided_by = $1, void_reason = $2 WHERE id = $3`
+      : `UPDATE separated_orders SET status = 'anulado', canceled_at = now(), canceled_by = $1, cancel_reason = $2 WHERE id = $3`,
     [req.session.userId, reason || null, req.params.id]
   );
   res.json({ ok: true });
