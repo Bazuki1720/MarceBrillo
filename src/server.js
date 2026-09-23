@@ -164,14 +164,22 @@ async function getVariantContext(client, variantId) {
 
 async function getSeparatedSchemaInfo(client = pool) {
   const { rows } = await client.query(`
-    SELECT column_name
+    SELECT table_name, column_name
     FROM information_schema.columns
     WHERE table_name IN ('separated_orders', 'separated_order_items', 'separated_payments')
   `);
-  const columns = new Set(rows.map((row) => row.column_name));
+  const tableColumns = new Map();
+  for (const row of rows) {
+    if (!tableColumns.has(row.table_name)) tableColumns.set(row.table_name, new Set());
+    tableColumns.get(row.table_name).add(row.column_name);
+  }
+  const orders = tableColumns.get('separated_orders') || new Set();
+  const items = tableColumns.get('separated_order_items') || new Set();
+  const payments = tableColumns.get('separated_payments') || new Set();
   return {
-    modern: columns.has('separation_number') && columns.has('customer_name') && columns.has('customer_phone') && columns.has('user_id') && columns.has('quantity_withdrawn'),
-    columns,
+    modern: orders.has('separation_number') && orders.has('customer_name') && orders.has('customer_phone') && orders.has('user_id')
+      && items.has('separated_order_id') && items.has('quantity_withdrawn')
+      && payments.has('separated_order_id'),
   };
 }
 
@@ -399,14 +407,7 @@ app.post('/api/separados', requireAuth, h(async (req, res) => {
   const paymentAmount = Number(initialPayment || 0);
   if (paymentAmount < 0) return res.status(400).json({ error: 'El abono inicial no puede ser negativo' });
 
-  const schemaRows = await pool.query(
-    `SELECT column_name
-     FROM information_schema.columns
-     WHERE table_name IN ('separated_orders', 'separated_order_items', 'separated_payments')
-     ORDER BY table_name, ordinal_position`
-  );
-  const schemaColumns = new Set(schemaRows.rows.map((row) => row.column_name));
-  const useModernSeparatedSchema = schemaColumns.has('separation_number') && schemaColumns.has('quantity_withdrawn');
+  const { modern: useModernSeparatedSchema } = await getSeparatedSchemaInfo();
 
   const result = await withTransaction(async (client) => {
     let total = 0;

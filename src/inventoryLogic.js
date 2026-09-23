@@ -124,13 +124,20 @@ async function voidSale(saleId, userId, reason) {
 
 async function getReservedQuantityForVariant(client, variantId) {
   const { rows: schemaRows } = await client.query(
-    `SELECT column_name
+    `SELECT table_name, column_name
      FROM information_schema.columns
-     WHERE table_name IN ('separated_orders', 'separated_order_items')
-     ORDER BY table_name, ordinal_position`
+     WHERE table_name IN ('separated_orders', 'separated_order_items')`
   );
-  const columns = new Set(schemaRows.map((row) => row.column_name));
-  const useModernSeparatedSchema = columns.has('separation_number') && columns.has('quantity_withdrawn');
+  const tableColumns = new Map();
+  for (const row of schemaRows) {
+    if (!tableColumns.has(row.table_name)) tableColumns.set(row.table_name, new Set());
+    tableColumns.get(row.table_name).add(row.column_name);
+  }
+  const orders = tableColumns.get('separated_orders') || new Set();
+  const items = tableColumns.get('separated_order_items') || new Set();
+  const useModernSeparatedSchema = orders.has('separation_number') && orders.has('customer_name')
+    && orders.has('customer_phone') && orders.has('user_id')
+    && items.has('separated_order_id') && items.has('quantity_withdrawn');
   const query = useModernSeparatedSchema
     ? `SELECT COALESCE(SUM(soi.quantity - soi.quantity_withdrawn), 0)::int AS reserved
        FROM separated_order_items soi
