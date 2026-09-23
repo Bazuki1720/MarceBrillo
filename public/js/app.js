@@ -135,8 +135,15 @@ async function renderSeparatedOrders(searchTerm = '') {
   `;
   const input = document.getElementById('separatedSearch');
   if (input) {
-    input.addEventListener('input', () => {
-      renderSeparatedOrders(input.value);
+    input.addEventListener('input', async () => {
+      const value = input.value;
+      const cursorPosition = input.selectionStart;
+      await renderSeparatedOrders(value);
+      const nextInput = document.getElementById('separatedSearch');
+      if (nextInput) {
+        nextInput.focus();
+        nextInput.setSelectionRange(cursorPosition, cursorPosition);
+      }
     });
   }
 }
@@ -198,8 +205,15 @@ async function renderCreditSales(searchTerm = '') {
   `;
   const input = document.getElementById('fiadoSearch');
   if (input) {
-    input.addEventListener('input', () => {
-      renderCreditSales(input.value);
+    input.addEventListener('input', async () => {
+      const value = input.value;
+      const cursorPosition = input.selectionStart;
+      await renderCreditSales(value);
+      const nextInput = document.getElementById('fiadoSearch');
+      if (nextInput) {
+        nextInput.focus();
+        nextInput.setSelectionRange(cursorPosition, cursorPosition);
+      }
     });
   }
 }

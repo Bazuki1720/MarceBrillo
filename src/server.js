@@ -24,8 +24,9 @@ app.use(
 // Wraps an async route handler so thrown errors are forwarded to Express instead of crashing.
 function h(fn) {
   return (req, res, next) => fn(req, res, next).catch((err) => {
-    console.error(err);
-    res.status(500).json({ error: 'Error interno del servidor' });
+    console.error(`API ${req.method} ${req.originalUrl}`, err);
+    const statusCode = Number.isInteger(err.statusCode) && err.statusCode >= 400 && err.statusCode < 500 ? err.statusCode : 500;
+    res.status(statusCode).json({ error: statusCode < 500 ? err.message : 'Error interno del servidor' });
   });
 }
 
@@ -179,7 +180,7 @@ async function getSeparatedSchemaInfo(client = pool) {
   return {
     modern: orders.has('separation_number') && orders.has('customer_name') && orders.has('customer_phone') && orders.has('user_id')
       && items.has('separated_order_id') && items.has('quantity_withdrawn')
-      && payments.has('separated_order_id'),
+      && (!payments.size || payments.has('separated_order_id')),
   };
 }
 
