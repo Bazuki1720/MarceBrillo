@@ -249,7 +249,9 @@ async function renderCreditDetail(id) {
 
 async function openSeparatedModal() {
   const products = await api.get('/api/products');
-  const usableProducts = (products || []).filter((product) => product.status === 'activo');
+  const usableProducts = (products || []).filter((product) => product.status === 'activo')
+    .map((product) => ({ ...product, variants: product.variants.filter((variant) => variant.available_quantity > 0) }))
+    .filter((product) => product.variants.length > 0);
   showModal(`
     <h3>Nuevo separado</h3>
     <form id="separatedForm">
@@ -357,7 +359,9 @@ async function openSeparatedModal() {
 
 async function openFiadoModal() {
   const products = await api.get('/api/products');
-  const usableProducts = (products || []).filter((product) => product.status === 'activo');
+  const usableProducts = (products || []).filter((product) => product.status === 'activo')
+    .map((product) => ({ ...product, variants: product.variants.filter((variant) => variant.available_quantity > 0) }))
+    .filter((product) => product.variants.length > 0);
   showModal(`
     <h3>Nuevo fiado</h3>
     <form id="fiadoForm">
@@ -1026,11 +1030,10 @@ async function loadSaleSearchResults(q) {
       <div class="name">${escapeHtml(p.name)}</div>
       <div class="meta">${fmtMoney(p.price)}</div>
       <div class="size-chip-row">
-        ${p.variants.map((v) => `
+        ${p.variants.filter((v) => v.available_quantity > 0).map((v) => `
           <button type="button" class="btn btn-outline" style="padding:8px 14px;font-size:14px"
-            onclick='addToCart(${JSON.stringify({ variantId: v.variant_id, size: v.size, reference: p.reference, name: p.name, price: p.price, available: v.quantity }).replace(/'/g, "&#39;")})'
-            ${v.quantity <= 0 ? 'disabled' : ''}>
-            ${escapeHtml(v.size || 'Agregar')} ${v.size ? '(' + v.quantity + ')' : (v.quantity <= 0 ? '(Sin stock)' : '')}
+            onclick='addToCart(${JSON.stringify({ variantId: v.variant_id, size: v.size, reference: p.reference, name: p.name, price: p.price, available: v.available_quantity }).replace(/'/g, "&#39;")})'>
+            ${escapeHtml(v.size || 'Agregar')} ${v.size ? '(' + v.available_quantity + ')' : ''}
           </button>
         `).join('')}
       </div>

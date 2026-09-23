@@ -71,6 +71,23 @@ async function createSale(items, userId, paymentMethod = 'no_especificado', paym
     const saleId = saleRes.rows[0].id;
 
     for (const it of items) {
+      const statusRes = await client.query(
+        `SELECT p.status FROM product_variants pv JOIN products p ON p.id = pv.product_id WHERE pv.id = $1`,
+        [it.variantId]
+      );
+      if (!statusRes.rows[0] || statusRes.rows[0].status !== 'activo') {
+        const error = new Error('El producto no está activo');
+        error.statusCode = 400;
+        throw error;
+      }
+      const inventoryRes = await client.query('SELECT COALESCE(quantity, 0)::int AS quantity FROM inventory WHERE variant_id = $1 FOR UPDATE', [it.variantId]);
+      const available = await getAvailableQuantityForVariant(client, it.variantId);
+      if (!inventoryRes.rows[0] || it.quantity > available) {
+        const error = new Error(`Stock insuficiente. Disponible: ${Math.max(0, available)}`);
+        error.code = 'STOCK_INSUFICIENTE';
+        error.statusCode = 400;
+        throw error;
+      }
       await client.query(
         `INSERT INTO sale_items (sale_id, variant_id, product_reference, product_name, category_id, size, quantity, unit_price, subtotal)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
@@ -138,21 +155,23 @@ async function getReservedQuantityForVariant(client, variantId) {
   const useModernSeparatedSchema = orders.has('separation_number') && orders.has('customer_name')
     && orders.has('customer_phone') && orders.has('user_id')
     && items.has('separated_order_id') && items.has('quantity_withdrawn');
-  const query = useModernSeparatedSchema
-    ? `SELECT COALESCE(SUM(soi.quantity - soi.quantity_withdrawn), 0)::int AS reserved
+    const query = useModernSeparatedSchema
+     ? `SELECT soi.quantity, soi.quantity_withdrawn AS withdrawn
        FROM separated_order_items soi
        JOIN separated_orders so ON so.id = soi.separated_order_id
-       WHERE soi.variant_id = $1 AND so.status = 'activo'`
-    : `SELECT COALESCE(SUM(soi.quantity - soi.retired_quantity), 0)::int AS reserved
+       WHERE soi.variant_id = $1 AND so.status = 'activo'
+       FOR UPDATE OF soi, so`
+     : `SELECT soi.quantity, soi.retired_quantity AS withdrawn
        FROM separated_order_items soi
        JOIN separated_orders so ON so.id = soi.order_id
-       WHERE soi.variant_id = $1 AND so.status = 'activo'`;
-  const { rows } = await client.query(query, [variantId]);
-  return Number(rows[0]?.reserved || 0);
+       WHERE soi.variant_id = $1 AND so.status = 'activo'
+       FOR UPDATE OF soi, so`;
+    const { rows } = await client.query(query, [variantId]);
+    return rows.reduce((reserved, row) => reserved + Number(row.quantity || 0) - Number(row.withdrawn || 0), 0);
 }
 
 async function getAvailableQuantityForVariant(client, variantId) {
-  const inventoryRes = await client.query('SELECT COALESCE(quantity, 0)::int AS quantity FROM inventory WHERE variant_id = $1', [variantId]);
+    const inventoryRes = await client.query('SELECT COALESCE(quantity, 0)::int AS quantity FROM inventory WHERE variant_id = $1 FOR UPDATE', [variantId]);
   const physical = Number(inventoryRes.rows[0]?.quantity || 0);
   const reserved = await getReservedQuantityForVariant(client, variantId);
   return physical - reserved;
