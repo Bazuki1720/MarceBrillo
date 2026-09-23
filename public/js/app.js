@@ -250,6 +250,8 @@ async function openSeparatedModal() {
       <input id="sepVariant" type="hidden" />
       <div class="field"><label>Cantidad</label><input id="sepQty" type="number" min="1" value="1" required /></div>
       <div class="field"><label>Precio unitario</label><input id="sepPrice" type="number" min="0" step="1" value="0" required /></div>
+      <button id="sepAddItem" class="btn btn-outline btn-block" type="button">Agregar producto</button>
+      <div id="sepItems" class="search-results" style="margin:10px 0"></div>
       <div class="field"><label>Abono inicial</label><input id="sepInitialPayment" type="number" min="0" step="1" value="0" /></div>
       <div class="field"><label>Fecha límite</label><input id="sepDueAt" type="date" /></div>
       <button class="btn btn-primary btn-block" type="submit">Guardar separado</button>
@@ -259,6 +261,8 @@ async function openSeparatedModal() {
   const searchInput = document.getElementById('sepProductSearch');
   const resultsContainer = document.getElementById('sepProductResults');
   const selectedProductLabel = document.getElementById('sepSelectedProduct');
+  const selectedItems = [];
+  let selectedEntry = null;
   const productMatches = usableProducts.flatMap((product) => product.variants.map((variant) => ({
     product,
     variant,
@@ -286,6 +290,7 @@ async function openSeparatedModal() {
         if (!selectedProduct) return;
         document.getElementById('sepVariant').value = String(variantId);
         document.getElementById('sepPrice').value = String(selectedProduct.product.price);
+        selectedEntry = selectedProduct;
         selectedProductLabel.textContent = `Seleccionado: ${selectedProduct.product.reference}${selectedProduct.variant.size ? ' · talla ' + selectedProduct.variant.size : ''} · ${fmtMoney(selectedProduct.product.price)}`;
         searchInput.value = selectedProduct.product.reference;
       });
@@ -295,15 +300,37 @@ async function openSeparatedModal() {
   searchInput.addEventListener('input', () => renderProductMatches(searchInput.value));
   renderProductMatches();
 
+  const renderSelectedItems = () => {
+    document.getElementById('sepItems').innerHTML = selectedItems.length === 0
+      ? '<p class="helper-text">Agrega los productos del separado.</p>'
+      : selectedItems.map((item, index) => `<div class="product-item" style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:8px 10px"><span>${escapeHtml(item.label)} · ${item.quantity} × ${fmtMoney(item.unitPrice)}</span><button type="button" class="btn btn-danger" data-remove-sep="${index}">Quitar</button></div>`).join('');
+    document.querySelectorAll('[data-remove-sep]').forEach((button) => {
+      button.addEventListener('click', () => { selectedItems.splice(Number(button.dataset.removeSep), 1); renderSelectedItems(); });
+    });
+  };
+  renderSelectedItems();
+  document.getElementById('sepAddItem').addEventListener('click', () => {
+    const variantId = Number(document.getElementById('sepVariant').value);
+    const quantity = Number(document.getElementById('sepQty').value);
+    const unitPrice = Number(document.getElementById('sepPrice').value);
+    if (!variantId || !selectedEntry) return toast('Busca y selecciona un producto antes de agregarlo.', 'error');
+    if (!quantity || quantity <= 0 || !Number.isFinite(unitPrice) || unitPrice < 0) return toast('Revisa la cantidad y el precio del producto.', 'error');
+    selectedItems.push({ variantId, quantity, unitPrice, label: `${selectedEntry.product.reference}${selectedEntry.variant.size ? ' · talla ' + selectedEntry.variant.size : ''}` });
+    renderSelectedItems();
+    selectedEntry = null;
+    document.getElementById('sepVariant').value = '';
+    selectedProductLabel.textContent = 'Producto agregado. Selecciona otro para continuar.';
+    searchInput.value = '';
+  });
+
   document.getElementById('separatedForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     try {
-      const variantId = Number(document.getElementById('sepVariant').value);
-      if (!variantId) throw new Error('Busca y selecciona un producto antes de guardar el separado.');
+      if (selectedItems.length === 0) throw new Error('Agrega al menos un producto antes de guardar el separado.');
       await api.post('/api/separados', {
         clientName: document.getElementById('sepClient').value,
         phone: document.getElementById('sepPhone').value,
-        items: [{ variantId, quantity: Number(document.getElementById('sepQty').value), unitPrice: Number(document.getElementById('sepPrice').value) }],
+        items: selectedItems.map(({ label, ...item }) => item),
         initialPayment: Number(document.getElementById('sepInitialPayment').value || 0),
         dueAt: document.getElementById('sepDueAt').value || null,
       });
@@ -331,6 +358,8 @@ async function openFiadoModal() {
       <input id="fiaVariant" type="hidden" />
       <div class="field"><label>Cantidad</label><input id="fiaQty" type="number" min="1" value="1" required /></div>
       <div class="field"><label>Precio unitario</label><input id="fiaPrice" type="number" min="0" step="1" value="0" required /></div>
+      <button id="fiaAddItem" class="btn btn-outline btn-block" type="button">Agregar producto</button>
+      <div id="fiaItems" class="search-results" style="margin:10px 0"></div>
       <div class="field"><label>Abono inicial</label><input id="fiaInitialPayment" type="number" min="0" step="1" value="0" /></div>
       <button class="btn btn-primary btn-block" type="submit">Guardar fiado</button>
     </form>
@@ -339,6 +368,8 @@ async function openFiadoModal() {
   const searchInput = document.getElementById('fiaProductSearch');
   const resultsContainer = document.getElementById('fiaProductResults');
   const selectedProductLabel = document.getElementById('fiaSelectedProduct');
+  const selectedItems = [];
+  let selectedEntry = null;
   const productMatches = usableProducts.flatMap((product) => product.variants.map((variant) => ({
     product,
     variant,
@@ -366,6 +397,7 @@ async function openFiadoModal() {
         if (!selectedProduct) return;
         document.getElementById('fiaVariant').value = String(variantId);
         document.getElementById('fiaPrice').value = String(selectedProduct.product.price);
+        selectedEntry = selectedProduct;
         selectedProductLabel.textContent = `Seleccionado: ${selectedProduct.product.reference}${selectedProduct.variant.size ? ' · talla ' + selectedProduct.variant.size : ''} · ${fmtMoney(selectedProduct.product.price)}`;
         searchInput.value = selectedProduct.product.reference;
       });
@@ -375,15 +407,37 @@ async function openFiadoModal() {
   searchInput.addEventListener('input', () => renderProductMatches(searchInput.value));
   renderProductMatches();
 
+  const renderSelectedItems = () => {
+    document.getElementById('fiaItems').innerHTML = selectedItems.length === 0
+      ? '<p class="helper-text">Agrega los productos del fiado.</p>'
+      : selectedItems.map((item, index) => `<div class="product-item" style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:8px 10px"><span>${escapeHtml(item.label)} · ${item.quantity} × ${fmtMoney(item.unitPrice)}</span><button type="button" class="btn btn-danger" data-remove-fia="${index}">Quitar</button></div>`).join('');
+    document.querySelectorAll('[data-remove-fia]').forEach((button) => {
+      button.addEventListener('click', () => { selectedItems.splice(Number(button.dataset.removeFia), 1); renderSelectedItems(); });
+    });
+  };
+  renderSelectedItems();
+  document.getElementById('fiaAddItem').addEventListener('click', () => {
+    const variantId = Number(document.getElementById('fiaVariant').value);
+    const quantity = Number(document.getElementById('fiaQty').value);
+    const unitPrice = Number(document.getElementById('fiaPrice').value);
+    if (!variantId || !selectedEntry) return toast('Busca y selecciona un producto antes de agregarlo.', 'error');
+    if (!quantity || quantity <= 0 || !Number.isFinite(unitPrice) || unitPrice < 0) return toast('Revisa la cantidad y el precio del producto.', 'error');
+    selectedItems.push({ variantId, quantity, unitPrice, label: `${selectedEntry.product.reference}${selectedEntry.variant.size ? ' · talla ' + selectedEntry.variant.size : ''}` });
+    renderSelectedItems();
+    selectedEntry = null;
+    document.getElementById('fiaVariant').value = '';
+    selectedProductLabel.textContent = 'Producto agregado. Selecciona otro para continuar.';
+    searchInput.value = '';
+  });
+
   document.getElementById('fiadoForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     try {
-      const variantId = Number(document.getElementById('fiaVariant').value);
-      if (!variantId) throw new Error('Busca y selecciona un producto antes de guardar el fiado.');
+      if (selectedItems.length === 0) throw new Error('Agrega al menos un producto antes de guardar el fiado.');
       await api.post('/api/fiados', {
         clientName: document.getElementById('fiaClient').value,
         phone: document.getElementById('fiaPhone').value,
-        items: [{ variantId, quantity: Number(document.getElementById('fiaQty').value), unitPrice: Number(document.getElementById('fiaPrice').value) }],
+        items: selectedItems.map(({ label, ...item }) => item),
         initialPayment: Number(document.getElementById('fiaInitialPayment').value || 0),
       });
       closeModal();
