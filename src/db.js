@@ -9,8 +9,8 @@ if (!process.env.DATABASE_URL) {
 // Neon requiere SSL. Para una base de datos Postgres local en desarrollo (sin SSL),
 // define PGSSL=disable en tu .env.
 const useSSL = process.env.PGSSL !== 'disable';
-const changeNotificationsSupported = Boolean(process.env.DATABASE_URL_DIRECT)
-  || !/-pooler(?:\.|$)/i.test(new URL(process.env.DATABASE_URL).hostname);
+const listenerConnectionString = process.env.DATABASE_URL_DIRECT || process.env.DATABASE_URL;
+const changeNotificationsSupported = !/-pooler(?:\.|$)/i.test(new URL(listenerConnectionString).hostname);
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,

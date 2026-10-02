@@ -94,8 +94,8 @@ Ver `.env.example`. Las más importantes:
 
 - `DATABASE_URL`: cadena de conexión de tu base de datos Neon (obligatoria).
 - `DATABASE_URL_DIRECT`: conexión directa opcional a la misma base para eventos inmediatos `LISTEN/NOTIFY`; usa el host sin `-pooler`.
-- `SESSION_SECRET`: clave para firmar las sesiones. Usa un valor largo y aleatorio en producción.
-- `ADMIN_USERNAME` / `ADMIN_PASSWORD`: solo se usan una vez, cuando la tabla de usuarios está vacía.
+- `SESSION_SECRET`: clave para firmar las sesiones. Obligatoria en producción; usa un valor largo y aleatorio.
+- `ADMIN_USERNAME` / `ADMIN_PASSWORD`: se usan una vez cuando la tabla de usuarios está vacía; la contraseña es obligatoria en producción.
 - `PGSSL=disable`: solo para pruebas locales contra un Postgres sin SSL en tu propia máquina; **no la uses con Neon**, que siempre requiere SSL.
 
 ## Base de datos
@@ -116,11 +116,21 @@ No hay migraciones separadas: el esquema se crea automáticamente (`CREATE TABLE
 `tests/run.js` contiene pruebas end-to-end que ejercitan la API real: autenticación, productos, inventario por variantes, sincronización SSE, ventas, separados, fiados, anulaciones, informes, usuarios y permisos.
 
 ```bash
-node src/server.js &         # levanta el servidor (usa la base de datos de tu .env)
-node tests/run.js            # corre las pruebas contra http://localhost:3000
+npm test                     # pruebas locales, sin servidor ni base de datos
+npm start                    # inicia la aplicación
 ```
 
-**Importante:** estas pruebas crean datos de ejemplo (categorías y productos de prueba) en la base de datos contra la que las corras. No las ejecutes contra tu base de datos de producción con datos reales de ventas — usa una base de Neon aparte para pruebas si quieres repetirlas.
+Las pruebas end-to-end requieren un servicio y una base de datos desechable. Para evitar escrituras accidentales, no corren si no defines explícitamente `TEST_BASE_URL` y `ALLOW_E2E_TEST_WRITES=true`; usa credenciales de la base de pruebas mediante `TEST_ADMIN_USERNAME` y `TEST_ADMIN_PASSWORD`. Nunca habilites E2E contra producción.
+
+En PowerShell:
+
+```powershell
+$env:TEST_BASE_URL = 'http://localhost:3000'
+$env:TEST_ADMIN_USERNAME = 'admin'
+$env:TEST_ADMIN_PASSWORD = 'clave-de-la-base-de-pruebas'
+$env:ALLOW_E2E_TEST_WRITES = 'true'
+npm run test:e2e
+```
 
 ## Backup
 
@@ -133,13 +143,14 @@ pg_dump "TU_DATABASE_URL_DE_NEON" > respaldo-$(date +%Y%m%d).sql
 ## Seguridad implementada
 
 - Contraseñas con hash `bcrypt` (nunca se guardan en texto plano).
-- Sesiones de servidor con cookies `httpOnly`.
+- Sesiones de servidor con cookies `httpOnly`, `secure` en producción y renovación del identificador al iniciar sesión.
 - Conexión a la base de datos siempre con SSL (obligatorio en Neon).
 - Todas las rutas de la API (excepto login) requieren sesión iniciada; las de usuarios requieren rol administrador.
 - Validación en el backend de todos los datos críticos (no solo en el frontend).
 - Consultas parametrizadas en toda la aplicación (sin concatenar SQL, protegido contra inyección SQL).
 - El inventario nunca puede quedar negativo: se valida dentro de la misma transacción que registra la venta (usando bloqueo de fila `FOR UPDATE`, seguro incluso si dos ventas ocurren al mismo tiempo).
 - Variables sensibles (`DATABASE_URL`, `SESSION_SECRET`, credenciales) fuera del código, en `.env` (no se sube a git).
+- El restablecimiento destructivo está deshabilitado en producción; en una base local desechable requiere `ALLOW_DATA_RESET=true`.
 
 ## Estructura del proyecto
 

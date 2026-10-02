@@ -5,7 +5,7 @@ const session = require('express-session');
 const bcrypt = require('bcryptjs');
 const { pool, changeListenerPool, changeNotificationsSupported, initSchema, withTransaction } = require('./db');
 const { requireAuth, requireAdmin } = require('./auth');
-const { getOrCreateVariant, recordMovement, createSale, voidSale, getAvailableQuantityForVariant, getReservedQuantityForVariant } = require('./inventoryLogic');
+const { getOrCreateVariant, orderItemsByVariantId, recordMovement, createSale, voidSale, getAvailableQuantityForVariant, getReservedQuantityForVariant } = require('./inventoryLogic');
 const reports = require('./reports');
 const { toCents, fromCents } = require('./money');
 const MAX_STOCK_QUANTITY = 2147483647;
@@ -16,15 +16,24 @@ const CHANGE_CHANNEL = 'marce_brillo_changes';
 const changeSubscribers = new Set();
 let changeListenerClient = null;
 let changeListenerRetryTimer = null;
+const isProduction = process.env.NODE_ENV === 'production' || Boolean(process.env.RENDER_EXTERNAL_URL);
+const sessionSecret = process.env.SESSION_SECRET || (isProduction ? null : 'dev-secret-change-in-env');
+const canResetData = !isProduction && process.env.ALLOW_DATA_RESET === 'true';
+if (!sessionSecret) throw new Error('SESSION_SECRET es obligatorio en producción');
 app.use(express.json());
+app.use('/api', (req, res, next) => {
+  res.set('Cache-Control', 'no-store');
+  next();
+});
+app.set('trust proxy', isProduction ? 1 : false);
 app.use(
   session({
     // In-memory session store: fine for this app (single small team, one server instance).
     // Sessions reset if the server restarts, which just means logging in again.
-    secret: process.env.SESSION_SECRET || 'dev-secret-change-in-env',
+    secret: sessionSecret,
     resave: false,
     saveUninitialized: false,
-    cookie: { maxAge: 1000 * 60 * 60 * 8, httpOnly: true, sameSite: 'lax' },
+    cookie: { maxAge: 1000 * 60 * 60 * 8, httpOnly: true, sameSite: 'lax', secure: isProduction },
   })
 );
 
@@ -87,6 +96,9 @@ app.post('/api/login', h(async (req, res) => {
   if (!user || !bcrypt.compareSync(password, user.password_hash)) {
     return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
   }
+  await new Promise((resolve, reject) => {
+    req.session.regenerate((error) => error ? reject(error) : resolve());
+  });
   req.session.userId = user.id;
   req.session.username = user.username;
   req.session.fullName = user.full_name;
@@ -95,12 +107,15 @@ app.post('/api/login', h(async (req, res) => {
 }));
 
 app.post('/api/logout', (req, res) => {
-  req.session.destroy(() => res.json({ ok: true }));
+  req.session.destroy((error) => {
+    if (error) return res.status(500).json({ error: 'No se pudo cerrar la sesión' });
+    res.clearCookie('connect.sid', { httpOnly: true, sameSite: 'lax', secure: isProduction });
+    res.json({ ok: true });
+  });
 });
 
-app.get('/api/me', (req, res) => {
-  if (!req.session.userId) return res.status(401).json({ error: 'No autenticado' });
-  res.json({ userId: req.session.userId, username: req.session.username, fullName: req.session.fullName, role: req.session.role });
+app.get('/api/me', requireAuth, (req, res) => {
+  res.json({ userId: req.session.userId, username: req.session.username, fullName: req.session.fullName, role: req.session.role, canResetData });
 });
 
 app.get('/api/events', requireAuth, (req, res) => {
@@ -128,12 +143,17 @@ app.get('/api/users', requireAuth, requireAdmin, h(async (req, res) => {
 
 app.post('/api/users', requireAuth, requireAdmin, h(async (req, res) => {
   const { username, password, fullName, role } = req.body || {};
-  if (!username || !password || !fullName) return res.status(400).json({ error: 'Datos incompletos' });
+  if (typeof username !== 'string' || !username.trim() || username.length > 64
+    || typeof fullName !== 'string' || !fullName.trim() || fullName.length > 160
+    || typeof password !== 'string' || Buffer.byteLength(password, 'utf8') < 8 || Buffer.byteLength(password, 'utf8') > 72
+    || !['admin', 'vendedor'].includes(role)) {
+    return res.status(400).json({ error: 'Usuario, nombre, contraseña de 8 a 72 bytes y rol válido son obligatorios' });
+  }
   try {
     const hash = bcrypt.hashSync(password, 10);
     const { rows } = await pool.query(
       'INSERT INTO users (username, password_hash, full_name, role) VALUES ($1, $2, $3, $4) RETURNING id',
-      [username, hash, fullName, role === 'vendedor' ? 'vendedor' : 'admin']
+      [username.trim(), hash, fullName.trim(), role]
     );
     res.json({ id: rows[0].id });
   } catch (e) {
@@ -144,11 +164,28 @@ app.post('/api/users', requireAuth, requireAdmin, h(async (req, res) => {
 
 app.patch('/api/users/:id', requireAuth, requireAdmin, h(async (req, res) => {
   const { active } = req.body || {};
-  await pool.query('UPDATE users SET active = $1 WHERE id = $2', [!!active, req.params.id]);
+  const userId = Number(req.params.id);
+  if (!Number.isInteger(userId) || userId <= 0 || typeof active !== 'boolean') {
+    return res.status(400).json({ error: 'Usuario y estado válido son obligatorios' });
+  }
+  await withTransaction(async (client) => {
+    await client.query("SELECT id FROM users WHERE role = 'admin' AND active = TRUE ORDER BY id FOR UPDATE");
+    const target = await client.query('SELECT id, role, active FROM users WHERE id = $1 FOR UPDATE', [userId]);
+    if (!target.rows[0]) throw Object.assign(new Error('Usuario no encontrado'), { statusCode: 404 });
+    if (!active && Number(req.session.userId) === userId) {
+      throw Object.assign(new Error('No puedes desactivar tu propia cuenta'), { statusCode: 400 });
+    }
+    if (!active && target.rows[0].role === 'admin' && target.rows[0].active) {
+      const remaining = await client.query("SELECT COUNT(*)::int AS total FROM users WHERE role = 'admin' AND active = TRUE AND id <> $1", [userId]);
+      if (remaining.rows[0].total === 0) throw Object.assign(new Error('No se puede desactivar al último administrador activo'), { statusCode: 400 });
+    }
+    await client.query('UPDATE users SET active = $1 WHERE id = $2', [active, userId]);
+  });
   res.json({ ok: true });
 }));
 
 app.post('/api/admin/reset-data', requireAuth, requireAdmin, h(async (req, res) => {
+  if (!canResetData) return res.status(403).json({ error: 'El restablecimiento de datos está deshabilitado en este entorno' });
   const { withTransaction } = require('./db');
   await withTransaction(async (client) => {
     await client.query(`
@@ -536,7 +573,7 @@ app.post('/api/separados', requireAuth, h(async (req, res) => {
     let totalCents = 0;
     const preparedItems = [];
     const requestedByVariant = new Map();
-    for (const item of items) {
+    for (const item of orderItemsByVariantId(items)) {
       const qty = Number(item.quantity);
       if (!Number.isInteger(qty) || qty <= 0 || qty > MAX_STOCK_QUANTITY) throw Object.assign(new Error('Cantidad inválida en el separado'), { statusCode: 400 });
       const variant = await getVariantContext(client, Number(item.variantId));
@@ -623,6 +660,9 @@ app.post('/api/separados', requireAuth, h(async (req, res) => {
 
 app.post('/api/separados/:id/pagos', requireAuth, h(async (req, res) => {
   const { amount, method = 'efectivo', note } = req.body || {};
+  if (!['efectivo', 'transferencia', 'addi', 'nequi', 'qr', 'daviplata'].includes(method)) {
+    return res.status(400).json({ error: 'Método de pago inválido' });
+  }
   const numericAmount = Number(amount);
   const amountCents = toCents(numericAmount);
   if (!Number.isFinite(numericAmount) || amountCents <= 0 || amountCents > MAX_MONEY_CENTS) return res.status(400).json({ error: 'El valor del abono debe ser mayor a cero y estar dentro del límite permitido' });
@@ -664,7 +704,7 @@ app.post('/api/separados/:id/retiro', requireAuth, h(async (req, res) => {
     if (!order) throw Object.assign(new Error('Separado no encontrado'), { statusCode: 404 });
     if (order.status === 'anulado') throw Object.assign(new Error('El separado ya está anulado'), { statusCode: 400 });
     const itemsRes = await client.query(
-      modern ? 'SELECT * FROM separated_order_items WHERE separated_order_id = $1 ORDER BY id' : 'SELECT * FROM separated_order_items WHERE order_id = $1 ORDER BY id',
+      modern ? 'SELECT * FROM separated_order_items WHERE separated_order_id = $1 ORDER BY variant_id, id' : 'SELECT * FROM separated_order_items WHERE order_id = $1 ORDER BY variant_id, id',
       [order.id]
     );
     let remaining = quantityToRetire;
@@ -716,6 +756,21 @@ app.post('/api/separados/:id/anular', requireAuth, h(async (req, res) => {
     if (!orderRes.rows[0]) throw Object.assign(new Error('Separado no encontrado'), { statusCode: 404 });
     if (orderRes.rows[0].status === 'anulado') throw Object.assign(new Error('Este separado ya está anulado'), { statusCode: 400 });
     if (orderRes.rows[0].status === 'completado') throw Object.assign(new Error('No se puede anular un separado completado'), { statusCode: 400 });
+    const paymentRes = await client.query(
+      modern
+        ? 'SELECT COALESCE(SUM(amount), 0)::numeric AS paid FROM separated_payments WHERE separated_order_id = $1'
+        : 'SELECT COALESCE(SUM(amount), 0)::numeric AS paid FROM separated_payments WHERE order_id = $1',
+      [req.params.id]
+    );
+    const itemsRes = await client.query(
+      modern
+        ? 'SELECT COALESCE(SUM(quantity_withdrawn), 0)::int AS withdrawn FROM separated_order_items WHERE separated_order_id = $1'
+        : 'SELECT COALESCE(SUM(retired_quantity), 0)::int AS withdrawn FROM separated_order_items WHERE order_id = $1',
+      [req.params.id]
+    );
+    if (Number(paymentRes.rows[0].paid) > 0 || Number(itemsRes.rows[0].withdrawn) > 0) {
+      throw Object.assign(new Error('No se puede anular: el separado ya tiene abonos o retiros registrados'), { statusCode: 400 });
+    }
     await client.query(
       modern
         ? `UPDATE separated_orders SET status = 'anulado', voided_at = now(), voided_by = $1, void_reason = $2 WHERE id = $3`
@@ -780,7 +835,7 @@ app.post('/api/fiados', requireAuth, h(async (req, res) => {
     let totalCents = 0;
     const preparedItems = [];
     const requestedByVariant = new Map();
-    for (const item of items) {
+    for (const item of orderItemsByVariantId(items)) {
       const qty = Number(item.quantity);
       const unitPrice = Number(item.unitPrice ?? 0);
       if (!Number.isInteger(qty) || qty <= 0 || qty > MAX_STOCK_QUANTITY || !Number.isFinite(unitPrice) || unitPrice < 0) {
@@ -855,6 +910,9 @@ app.post('/api/fiados', requireAuth, h(async (req, res) => {
 
 app.post('/api/fiados/:id/pagos', requireAuth, h(async (req, res) => {
   const { amount, method = 'efectivo', note } = req.body || {};
+  if (!['efectivo', 'transferencia', 'addi', 'nequi', 'qr', 'daviplata'].includes(method)) {
+    return res.status(400).json({ error: 'Método de pago inválido' });
+  }
   const numericAmount = Number(amount);
   const amountCents = toCents(numericAmount);
   if (!Number.isFinite(numericAmount) || amountCents <= 0 || amountCents > MAX_MONEY_CENTS) return res.status(400).json({ error: 'El valor del abono debe ser mayor a cero y estar dentro del límite permitido' });
@@ -892,7 +950,11 @@ app.post('/api/fiados/:id/anular', requireAuth, h(async (req, res) => {
     const credit = await client.query('SELECT * FROM credit_sales WHERE id = $1 FOR UPDATE', [req.params.id]);
     if (!credit.rows[0]) throw Object.assign(new Error('Fiado no encontrado'), { statusCode: 404 });
     if (credit.rows[0].status === 'anulado') throw Object.assign(new Error('Este fiado ya está anulado'), { statusCode: 400 });
-    const itemsRes = await client.query('SELECT * FROM credit_sale_items WHERE credit_sale_id = $1 ORDER BY id', [req.params.id]);
+    const paymentRes = await client.query('SELECT COALESCE(SUM(amount), 0)::numeric AS paid FROM credit_payments WHERE credit_sale_id = $1', [req.params.id]);
+    if (Number(paymentRes.rows[0].paid) > 0) {
+      throw Object.assign(new Error('No se puede anular: el fiado ya tiene pagos registrados'), { statusCode: 400 });
+    }
+    const itemsRes = await client.query('SELECT * FROM credit_sale_items WHERE credit_sale_id = $1 ORDER BY variant_id, id', [req.params.id]);
     for (const item of itemsRes.rows) {
       await recordMovement(client, {
         variantId: item.variant_id,
@@ -1265,7 +1327,7 @@ app.post('/api/sales', requireAuth, h(async (req, res) => {
   const { withTransaction } = require('./db');
   try {
     await withTransaction(async (client) => {
-      for (const it of items) {
+      for (const it of orderItemsByVariantId(items)) {
         const variant = await getVariantContext(client, Number(it.variantId));
         const qty = Number(it.quantity);
         if (!Number.isInteger(qty) || qty <= 0 || qty > MAX_STOCK_QUANTITY) throw Object.assign(new Error('Cantidad inválida en el carrito'), { statusCode: 400 });
@@ -1360,7 +1422,9 @@ app.get('/api/reports/sales-timeline', requireAuth, h(async (req, res) => {
 
 app.get('/api/reports/top-products', requireAuth, h(async (req, res) => {
   const { from, to, limit } = req.query;
-  res.json(await reports.topProducts(from, to, Number(limit) || 10));
+  const requestedLimit = Number(limit);
+  const safeLimit = Number.isInteger(requestedLimit) && requestedLimit > 0 ? Math.min(requestedLimit, 100) : 10;
+  res.json(await reports.topProducts(from, to, safeLimit));
 }));
 
 app.get('/api/reports/by-category', requireAuth, h(async (req, res) => {

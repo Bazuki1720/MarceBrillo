@@ -1,9 +1,19 @@
 // End-to-end tests against a running server (see tests/README or npm test wrapper).
-const BASE = process.env.TEST_BASE_URL || 'http://localhost:3000';
 require('dotenv').config();
+process.env.DATABASE_URL ||= 'postgresql://unit:unit@127.0.0.1:1/unit';
+const BASE = process.env.TEST_BASE_URL;
+const TEST_RUN_ID = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+const TEST_ADMIN_USERNAME = process.env.TEST_ADMIN_USERNAME || process.env.ADMIN_USERNAME || 'admin';
+const TEST_ADMIN_PASSWORD = process.env.TEST_ADMIN_PASSWORD || process.env.ADMIN_PASSWORD || 'CambiarClave123';
+const TEST_CATEGORY_NAME = `Cinturones-Test-${TEST_RUN_ID}`;
+const TEST_PRODUCT_REFERENCE = `AJ-${TEST_RUN_ID}`;
+const TEST_BAG_REFERENCE = `BOL-${TEST_RUN_ID}`;
+const TEST_PRICE_REFERENCE = `PRC-${TEST_RUN_ID}`;
+const TEST_CENTS_REFERENCE = `PRCC-${TEST_RUN_ID}`;
+const TEST_SELLER_USERNAME = `vendedora-${TEST_RUN_ID}`;
 const { businessDate, resolveRange } = require('../src/reports');
 const { toCents, fromCents } = require('../src/money');
-const { pool } = require('../src/db');
+const { orderItemsByVariantId, recordMovement } = require('../src/inventoryLogic');
 
 let cookie = '';
 let passed = 0;
@@ -52,6 +62,40 @@ async function waitForChangeEvent(reader, timeoutMs = 3000) {
   }
 }
 
+async function testMissingInventoryRow() {
+  let quantity = null;
+  const calls = [];
+  const client = {
+    async query(sql, params = []) {
+      calls.push(sql);
+      if (sql.startsWith('INSERT INTO inventory')) {
+        if (quantity === null) quantity = 0;
+        return { rows: [] };
+      }
+      if (sql.startsWith('SELECT quantity FROM inventory')) {
+        return { rows: quantity === null ? [] : [{ quantity }] };
+      }
+      if (sql.startsWith('UPDATE inventory')) {
+        quantity = params[0];
+        return { rows: [] };
+      }
+      if (sql.includes('SELECT pv.size, p.reference')) {
+        return { rows: [{ size: null, reference: 'MOCK-STOCK' }] };
+      }
+      if (sql.startsWith('INSERT INTO inventory_movements')) return { rows: [] };
+      throw new Error(`Consulta inesperada en la prueba: ${sql}`);
+    },
+  };
+  const updatedQuantity = await recordMovement(client, {
+    variantId: 1,
+    type: 'entrada',
+    quantityChange: 1,
+    reason: 'Prueba aislada',
+    userId: 1,
+  });
+  assert(updatedQuantity === 1 && quantity === 1 && calls[0].startsWith('INSERT INTO inventory'), 'Un movimiento reconstruye una fila de stock faltante sin conexión a datos reales');
+}
+
 async function run() {
   console.log('--- LOCAL DATE AND MONEY ---');
   assert(businessDate(new Date('2026-10-02T02:00:00Z')) === '2026-10-01', 'La fecha de negocio respeta la zona horaria de Colombia');
@@ -61,16 +105,31 @@ async function run() {
   try { resolveRange('2026-10-03', '2026-10-02'); } catch (error) { invalidRangeRejected = error.statusCode === 400; }
   assert(invalidRangeRejected, 'Los informes rechazan rangos de fechas invertidos');
   assert(fromCents(toCents(100000.25)) === 100000.25, 'La conversión monetaria conserva centavos');
+  const unorderedItems = [{ variantId: 20 }, { variantId: 3 }];
+  const orderedItems = orderItemsByVariantId(unorderedItems);
+  assert(orderedItems[0].variantId === 3 && unorderedItems[0].variantId === 20, 'El orden global de locks es estable y no muta el carrito');
+  await testMissingInventoryRow();
+  if (!process.argv.includes('--e2e')) {
+    console.log(`\n${passed} pruebas locales pasaron.`);
+    if (failed > 0) process.exitCode = 1;
+    return;
+  }
+  if (!BASE || process.env.ALLOW_E2E_TEST_WRITES !== 'true') {
+    console.error('E2E cancelado: define TEST_BASE_URL y ALLOW_E2E_TEST_WRITES=true solo para un servidor conectado a una base de pruebas desechable.');
+    process.exitCode = 1;
+    return;
+  }
 
   console.log('--- LOGIN ---');
   let r = await req('POST', '/api/login', { username: 'nope', password: 'wrong' });
   assert(r.status === 401, 'Login con credenciales incorrectas es rechazado');
 
-  r = await req('POST', '/api/login', { username: 'admin', password: 'Marce2026!' });
+  r = await req('POST', '/api/login', { username: TEST_ADMIN_USERNAME, password: TEST_ADMIN_PASSWORD });
   assert(r.status === 200, 'Login con credenciales correctas funciona');
 
   r = await req('GET', '/api/me');
   assert(r.status === 200 && r.data.username === 'admin', 'Sesión activa devuelve el usuario');
+  const adminUserId = r.data.userId;
 
   console.log('--- CATEGORIES ---');
   r = await req('GET', '/api/categories');
@@ -91,24 +150,24 @@ async function run() {
   r = await req('GET', '/api/dashboard');
   assert(r.status === 200 && Number.isInteger(r.data.inventoryUnits) && Number.isInteger(r.data.availableInventoryUnits), 'Dashboard devuelve unidades físicas y disponibles');
 
-  r = await req('POST', '/api/categories', { name: 'Cinturones-Test' });
+  r = await req('POST', '/api/categories', { name: TEST_CATEGORY_NAME });
   assert(r.status === 200, 'Crear categoría nueva funciona');
   if (liveReader) assert(await waitForChangeEvent(liveReader), 'Los cambios confirmados llegan por el canal en tiempo real');
   liveController.abort();
   const catId = r.data.id;
 
   r = await req('POST', '/api/products', {
-    reference: 'TALLAS-EMPTY-TEST', name: 'Producto sin tallas', categoryId: catId, price: 1000,
+    reference: `TALLAS-EMPTY-${TEST_RUN_ID}`, name: 'Producto sin tallas', categoryId: catId, price: 1000,
     hasVariants: true, sizes: [],
   });
   assert(r.status === 400, 'No permite crear productos con tallas sin variantes');
 
-  r = await req('POST', '/api/categories', { name: 'Cinturones-Test' });
+  r = await req('POST', '/api/categories', { name: TEST_CATEGORY_NAME });
   assert(r.status === 409, 'No permite categorías duplicadas');
 
   console.log('--- PRODUCTS ---');
   r = await req('POST', '/api/products', {
-    reference: 'AJ-TEST-45', name: 'Sandalia test', categoryId: catId, price: 150000,
+    reference: TEST_PRODUCT_REFERENCE, name: 'Sandalia test', categoryId: catId, price: 150000,
     hasVariants: true, sizes: [{ size: '35', quantity: 2 }, { size: '36', quantity: 3 }],
   });
   assert(r.status === 200, 'Crear producto con tallas funciona');
@@ -121,27 +180,18 @@ async function run() {
   assert(r.status === 200 && r.data.some((movement) => movement.variant_id === variant35.variant_id) && r.data.some((movement) => movement.variant_id === variant36.variant_id), 'Movimientos de producto incluyen todas sus variantes');
 
   r = await req('POST', '/api/products', {
-    reference: 'AJ-TEST-45', name: 'Duplicado', categoryId: catId, price: 1000, hasVariants: false, initialStock: 1,
+    reference: TEST_PRODUCT_REFERENCE, name: 'Duplicado', categoryId: catId, price: 1000, hasVariants: false, initialStock: 1,
   });
   assert(r.status === 409, 'No permite referencias duplicadas');
 
   r = await req('POST', '/api/products', {
-    reference: 'BOL-TEST-12', name: 'Bolso test', categoryId: catId, price: 90000,
+    reference: TEST_BAG_REFERENCE, name: 'Bolso test', categoryId: catId, price: 90000,
     hasVariants: false, initialStock: 5,
   });
   assert(r.status === 200, 'Crear producto sin tallas funciona');
   const productNoSizes = r.data;
   assert(productNoSizes.total_stock === 5, 'Stock inicial sin tallas es correcto');
   assert(productNoSizes.variants.length === 1 && productNoSizes.variants[0].size === null, 'Producto sin tallas tiene una única variante sin talla');
-
-  r = await req('POST', '/api/products', {
-    reference: 'MISSING-STOCK-TEST', name: 'Variante sin fila de stock', categoryId: catId, price: 1000,
-    hasVariants: false, initialStock: 0,
-  });
-  const missingStockVariantId = r.data.variants[0].variant_id;
-  await pool.query('DELETE FROM inventory WHERE variant_id = $1', [missingStockVariantId]);
-  r = await req('POST', '/api/inventory/entry', { variantId: missingStockVariantId, quantity: 1, reason: 'Reconstrucción de fila' });
-  assert(r.status === 200 && r.data.newQuantity === 1, 'Una entrada repara y actualiza variantes sin fila de inventario');
 
   console.log('--- INVENTORY ENTRY ---');
   r = await req('POST', '/api/inventory/entry', { variantId: variant35.variant_id, quantity: 4, reason: 'Reposición' });
@@ -205,7 +255,7 @@ async function run() {
 
   console.log('--- PRICE HISTORY (historical price on sale) ---');
   r = await req('POST', '/api/products', {
-    reference: 'PRC-TEST', name: 'Producto precio', categoryId: catId, price: 100000, hasVariants: false, initialStock: 10,
+    reference: TEST_PRICE_REFERENCE, name: 'Producto precio', categoryId: catId, price: 100000, hasVariants: false, initialStock: 10,
   });
   const priceProduct = r.data;
   r = await req('POST', '/api/sales', { items: [{ variantId: priceProduct.variants[0].variant_id, quantity: 1 }] });
@@ -215,14 +265,14 @@ async function run() {
   assert(r.data.items[0].unit_price === 100000, 'La venta conserva el precio histórico aunque el precio actual cambie');
 
   r = await req('POST', '/api/products', {
-    reference: 'PRC-CENTS-TEST', name: 'Producto con centavos', categoryId: catId, price: 100000.25, hasVariants: false, initialStock: 1,
+    reference: TEST_CENTS_REFERENCE, name: 'Producto con centavos', categoryId: catId, price: 100000.25, hasVariants: false, initialStock: 1,
   });
   r = await req('POST', '/api/sales', { items: [{ variantId: r.data.variants[0].variant_id, quantity: 1 }] });
   assert(r.status === 200 && r.data.total === 100000.25, 'La venta conserva correctamente los centavos en su total');
 
   console.log('--- SEARCH ---');
-  r = await req('GET', '/api/products?q=AJ');
-  assert(r.data.some((p) => p.reference === 'AJ-TEST-45'), 'Búsqueda parcial por referencia funciona');
+  r = await req('GET', '/api/products?q=' + encodeURIComponent(TEST_PRODUCT_REFERENCE.slice(0, 3)));
+  assert(r.data.some((p) => p.reference === TEST_PRODUCT_REFERENCE), 'Búsqueda parcial por referencia funciona');
 
   console.log('--- REPORTS ---');
   r = await req('GET', '/api/reports/overview');
@@ -244,12 +294,15 @@ async function run() {
   assert(r.data.some((m) => m.type === 'venta'), 'Informe de movimientos incluye ventas registradas');
 
   console.log('--- USERS & PERMISSIONS ---');
-  r = await req('POST', '/api/users', { username: 'vendedora1', password: 'clave123', fullName: 'Vendedora Uno', role: 'vendedor' });
+  r = await req('POST', '/api/users', { username: TEST_SELLER_USERNAME, password: 'clave123', fullName: 'Vendedora Uno', role: 'vendedor' });
   assert(r.status === 200, 'Admin puede crear usuarios');
+  const sellerId = r.data.id;
 
   const adminCookie = cookie;
+  r = await req('PATCH', `/api/users/${adminUserId}`, { active: false });
+  assert(r.status === 400, 'Un administrador no puede desactivar su propia cuenta');
   cookie = '';
-  r = await req('POST', '/api/login', { username: 'vendedora1', password: 'clave123' });
+  r = await req('POST', '/api/login', { username: TEST_SELLER_USERNAME, password: 'clave123' });
   assert(r.status === 200, 'Vendedora puede iniciar sesión');
 
   r = await req('GET', '/api/users');
@@ -276,7 +329,7 @@ async function run() {
   assert(r.status === 200 && r.data.some((order) => order.client_name && order.client_name.toLowerCase().includes('ana')), 'La búsqueda de separados filtra por nombre del cliente sin distinguir mayúsculas');
 
   r = await req('GET', '/api/separados?q=' + encodeURIComponent(separatedProduct.reference));
-  assert(r.status === 200 && r.data.some((order) => order.id === r.data[0]?.id || true), 'La búsqueda de separados también filtra por código del producto');
+  assert(r.status === 200 && r.data.some((order) => order.id === separatedId), 'La búsqueda de separados también filtra por código del producto');
 
   r = await req('GET', '/api/products/' + separatedProduct.id);
   assert(r.data.variants[0].quantity === 8, 'La reserva de separado no descuenta el inventario físico');
@@ -290,7 +343,7 @@ async function run() {
   assert(r.status === 200 && r.data.items.reduce((sum, item) => sum + Number(item.retired_quantity || 0), 0) === 1, 'El retiro parcial queda reflejado en sus artículos');
 
   r = await req('POST', `/api/separados/${separatedId}/anular`, { reason: 'Prueba de liberación' });
-  assert(r.status === 200, 'Anular separado libera sus reservas activas');
+  assert(r.status === 400, 'No permite anular un separado con retiros ya registrados');
 
   r = await req('POST', '/api/separados', {
     clientName: 'Pedro',
@@ -305,7 +358,10 @@ async function run() {
     items: [{ variantId: separatedProduct.variants[0].variant_id, quantity: 1, unitPrice: 90000 }],
   });
   assert(r.status === 200 && r.data.orderId, 'Crear separado con un solo producto funciona');
-  if (r.status === 200) await req('POST', `/api/separados/${r.data.orderId}/anular`, { reason: 'Prueba de artículo único' });
+  if (r.status === 200) {
+    r = await req('POST', `/api/separados/${r.data.orderId}/anular`, { reason: 'Prueba de artículo único' });
+    assert(r.status === 200, 'Anular separado sin abonos ni retiros libera sus reservas');
+  }
 
   console.log('--- FIADOS ---');
   r = await req('GET', '/api/products/' + productWithSizes.id);
@@ -325,28 +381,45 @@ async function run() {
   r = await req('GET', '/api/fiados?q=' + encodeURIComponent('lucia'));
   assert(r.status === 200 && r.data.some((credit) => credit.client_name && credit.client_name.toLowerCase().includes('lucía') || credit.client_name && credit.client_name.toLowerCase().includes('lucia')), 'La búsqueda de fiados filtra por nombre del cliente sin distinguir mayúsculas');
 
-  r = await req('GET', '/api/fiados?q=' + encodeURIComponent('AJ-TEST-45'));
-  assert(r.status === 200, 'La búsqueda de fiados acepta filtros por código del producto');
+  r = await req('GET', '/api/fiados?q=' + encodeURIComponent(TEST_PRODUCT_REFERENCE));
+  assert(r.status === 200 && r.data.some((credit) => credit.id === creditId), 'La búsqueda de fiados filtra por código del producto');
 
   r = await req('POST', `/api/fiados/${creditId}/pagos`, { amount: 50000, method: 'efectivo' });
   assert(r.status === 200, 'Registrar abono del fiado funciona');
 
   r = await req('POST', `/api/fiados/${creditId}/anular`, { reason: 'Prueba de devolución' });
-  assert(r.status === 200, 'Anular fiado devuelve sus productos al inventario');
+  assert(r.status === 400, 'No permite anular un fiado con pagos registrados');
   r = await req('GET', '/api/products/' + productWithSizes.id);
   const stockAfterCreditVoid = r.data.variants.find((v) => v.size === '35').quantity;
-  assert(stockAfterCreditVoid === stockBeforeCredit, 'Anular fiado restaura exactamente el inventario');
+  assert(stockAfterCreditVoid === stockAfterCredit, 'El fiado pagado parcialmente conserva su inventario hasta conciliar la deuda');
+
+  r = await req('POST', '/api/fiados', {
+    clientName: 'Fiado sin abono', phone: '3117778899',
+    items: [{ variantId: variant35.variant_id, quantity: 1, unitPrice: 150000 }],
+  });
+  const unpaidCreditId = r.data.creditId;
+  r = await req('POST', `/api/fiados/${unpaidCreditId}/anular`, { reason: 'Prueba de devolución sin pago' });
+  assert(r.status === 200, 'Anular fiado sin pagos devuelve sus productos al inventario');
+  r = await req('GET', '/api/products/' + productWithSizes.id);
+  assert(r.data.variants.find((v) => v.size === '35').quantity === stockAfterCredit, 'La anulación limpia restaura exactamente el inventario');
 
   r = await req('GET', '/api/fiados');
   assert(r.status === 200 && Array.isArray(r.data), 'Lista fiados responde correctamente');
+
+  const sellerCookie = cookie;
+  cookie = adminCookie;
+  r = await req('PATCH', `/api/users/${sellerId}`, { active: false });
+  assert(r.status === 200, 'Admin puede desactivar una cuenta de vendedor');
+  cookie = sellerCookie;
+  r = await req('GET', '/api/me');
+  assert(r.status === 401, 'Una sesión de usuario desactivado pierde acceso inmediatamente');
+  cookie = adminCookie;
 
   console.log('--- LOGOUT ---');
   r = await req('POST', '/api/logout');
   assert(r.status === 200, 'Logout funciona');
   r = await req('GET', '/api/me');
   assert(r.status === 401, 'Tras logout la sesión ya no es válida');
-
-  cookie = adminCookie;
 
   console.log(`\n${passed} pruebas pasaron, ${failed} fallaron.`);
   if (failed > 0) process.exit(1);

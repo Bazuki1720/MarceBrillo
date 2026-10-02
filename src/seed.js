@@ -12,6 +12,10 @@ async function seed() {
 
   const { rows } = await pool.query('SELECT COUNT(*)::int as c FROM users');
   if (rows[0].c === 0) {
+    const isProduction = process.env.NODE_ENV === 'production' || Boolean(process.env.RENDER_EXTERNAL_URL);
+    if (isProduction && !process.env.ADMIN_PASSWORD) {
+      throw new Error('ADMIN_PASSWORD es obligatorio para crear el primer usuario en producción');
+    }
     const username = process.env.ADMIN_USERNAME || 'admin';
     const password = process.env.ADMIN_PASSWORD || 'CambiarClave123';
     const hash = bcrypt.hashSync(password, 10);
@@ -19,8 +23,7 @@ async function seed() {
       'INSERT INTO users (username, password_hash, full_name, role) VALUES ($1, $2, $3, $4)',
       [username, hash, 'Administrador', 'admin']
     );
-    console.log(`Usuario administrador creado: ${username} / ${password}`);
-    console.log('IMPORTANTE: cambia esta contraseña después del primer ingreso.');
+    console.log(`Usuario administrador creado: ${username}. Cambia la contraseña después del primer ingreso.`);
   } else {
     console.log('Ya existen usuarios, no se creó administrador nuevo.');
   }

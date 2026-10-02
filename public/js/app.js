@@ -140,7 +140,9 @@ function normalizeSearchValue(value) {
 
 // ---------------- DASHBOARD ----------------
 async function renderDashboard() {
+  const renderToken = navigationToken;
   const data = await api.get('/api/dashboard');
+  if (renderToken !== navigationToken) return;
   view.innerHTML = `
     <p class="hello">Hola, ${escapeHtml(CURRENT_USER.fullName.split(' ')[0])} 👋</p>
     <div class="stat-grid">
@@ -183,7 +185,11 @@ async function renderDashboard() {
 }
 
 async function renderSeparatedOrders(searchTerm = '') {
+  const requestId = (renderSeparatedOrders.lastRequestId || 0) + 1;
+  renderSeparatedOrders.lastRequestId = requestId;
+  const renderToken = navigationToken;
   const list = await api.get('/api/separados' + (searchTerm ? '?q=' + encodeURIComponent(searchTerm) : ''));
+  if (requestId !== renderSeparatedOrders.lastRequestId || renderToken !== navigationToken || parseHash().route !== 'separados') return;
   view.innerHTML = `
     ${backLink('dashboard', 'Inicio')}
     <h2 class="section-title">Separados</h2>
@@ -221,7 +227,9 @@ async function renderSeparatedOrders(searchTerm = '') {
 }
 
 async function renderSeparatedDetail(id) {
+  const renderToken = navigationToken;
   const order = await api.get('/api/separados/' + id);
+  if (renderToken !== navigationToken) return;
   view.innerHTML = `
     ${backLink('separados', 'Separados')}
     <h2 class="section-title">${escapeHtml(order.order_number)}</h2>
@@ -245,15 +253,19 @@ async function renderSeparatedDetail(id) {
       </div>
     `).join('')}
     <div style="display:flex;gap:10px;flex-wrap:wrap;margin:20px 0">
-      <button class="btn btn-primary" onclick="openSeparatedPayment(${order.id})">💰 Abonar</button>
-      <button class="btn btn-outline" onclick="openSeparatedRetiro(${order.id})">📦 Retirar</button>
-      <button class="btn btn-danger" onclick="openSeparatedCancel(${order.id})">🚫 Anular</button>
+      ${order.status !== 'anulado' && Number(order.balance) > 0 ? `<button class="btn btn-primary" onclick="openSeparatedPayment(${order.id})">💰 Abonar</button>` : ''}
+      ${order.status === 'activo' && order.items.some((item) => item.quantity > item.retired_quantity) ? `<button class="btn btn-outline" onclick="openSeparatedRetiro(${order.id})">📦 Retirar</button>` : ''}
+      ${order.status === 'activo' && Number(order.paid_amount) === 0 && order.items.every((item) => Number(item.retired_quantity) === 0) ? `<button class="btn btn-danger" onclick="openSeparatedCancel(${order.id})">🚫 Anular</button>` : ''}
     </div>
   `;
 }
 
 async function renderCreditSales(searchTerm = '') {
+  const requestId = (renderCreditSales.lastRequestId || 0) + 1;
+  renderCreditSales.lastRequestId = requestId;
+  const renderToken = navigationToken;
   const list = await api.get('/api/fiados' + (searchTerm ? '?q=' + encodeURIComponent(searchTerm) : ''));
+  if (requestId !== renderCreditSales.lastRequestId || renderToken !== navigationToken || parseHash().route !== 'fiados') return;
   view.innerHTML = `
     ${backLink('dashboard', 'Inicio')}
     <h2 class="section-title">Fiados</h2>
@@ -291,7 +303,9 @@ async function renderCreditSales(searchTerm = '') {
 }
 
 async function renderCreditDetail(id) {
+  const renderToken = navigationToken;
   const credit = await api.get('/api/fiados/' + id);
+  if (renderToken !== navigationToken) return;
   view.innerHTML = `
     ${backLink('fiados', 'Fiados')}
     <h2 class="section-title">${escapeHtml(credit.credit_number)}</h2>
@@ -313,8 +327,8 @@ async function renderCreditDetail(id) {
       </div>
     `).join('')}
     <div style="display:flex;gap:10px;flex-wrap:wrap;margin:20px 0">
-      <button class="btn btn-primary" onclick="openFiadoPayment(${credit.id})">💰 Abonar</button>
-      <button class="btn btn-danger" onclick="openFiadoCancel(${credit.id})">🚫 Anular</button>
+      ${credit.status !== 'anulado' && Number(credit.balance) > 0 ? `<button class="btn btn-primary" onclick="openFiadoPayment(${credit.id})">💰 Abonar</button>` : ''}
+      ${credit.status !== 'anulado' && Number(credit.paid_amount) === 0 ? `<button class="btn btn-danger" onclick="openFiadoCancel(${credit.id})">🚫 Anular</button>` : ''}
     </div>
   `;
 }
@@ -648,7 +662,15 @@ async function loadInventoryResults(q) {
   const container = document.getElementById('invResults');
   if (!container) return;
   const requestId = ++loadInventoryResults.lastRequestId;
-  const products = await api.get('/api/products?q=' + encodeURIComponent(q || ''));
+  let products;
+  try {
+    products = await api.get('/api/products?q=' + encodeURIComponent(q || ''));
+  } catch (error) {
+    if (requestId === loadInventoryResults.lastRequestId && document.getElementById('invResults')) {
+      container.innerHTML = '<div class="empty-state"><p>No se pudo cargar el inventario. Intenta de nuevo.</p><button class="btn btn-outline" onclick="loadInventoryResults(document.getElementById(\'invSearch\')?.value || \'\')">Reintentar</button></div>';
+    }
+    return;
+  }
   if (requestId !== loadInventoryResults.lastRequestId || !document.getElementById('invResults')) return;
   if (products.length === 0) {
     container.innerHTML = `<div class="empty-state"><div class="icon">🔍</div><p>No se encontraron productos.</p></div>`;
@@ -679,8 +701,10 @@ function productCardHtml(p) {
 
 // ---------------- PRODUCT DETAIL ----------------
 async function renderProductDetail(id) {
+  const renderToken = navigationToken;
   const p = await api.get('/api/products/' + id);
   const movements = await api.get('/api/inventory/movements?productId=' + encodeURIComponent(id) + '&limit=100');
+  if (renderToken !== navigationToken) return;
   view.innerHTML = `
     ${backLink('inventario', 'Inventario')}
     <h2 class="section-title">${escapeHtml(p.name)}</h2>
@@ -921,7 +945,9 @@ function closeModal() {
 let sizeRowCount = 0;
 
 async function renderProductForm() {
+  const renderToken = navigationToken;
   CATEGORIES = await api.get('/api/categories');
+  if (renderToken !== navigationToken) return;
   view.innerHTML = `
     ${backLink('inventario', 'Inventario')}
     <h2 class="section-title">Nuevo producto</h2>
@@ -1092,7 +1118,15 @@ async function loadSaleSearchResults(q) {
   if (!container) return;
   const requestId = ++loadSaleSearchResults.lastRequestId;
   if (!q || !q.trim()) { container.innerHTML = ''; return; }
-  const products = await api.get('/api/products?q=' + encodeURIComponent(q));
+  let products;
+  try {
+    products = await api.get('/api/products?q=' + encodeURIComponent(q));
+  } catch (error) {
+    if (requestId === loadSaleSearchResults.lastRequestId && document.getElementById('saleResults')) {
+      container.innerHTML = '<p class="helper-text">No se pudo buscar. Intenta de nuevo.</p>';
+    }
+    return;
+  }
   if (requestId !== loadSaleSearchResults.lastRequestId || !document.getElementById('saleResults')) return;
   const active = products.filter((p) => p.status === 'activo');
   if (active.length === 0) {
@@ -1212,7 +1246,9 @@ async function confirmSale() {
 
 // ---------------- HISTORY ----------------
 async function renderHistory() {
+  const renderToken = navigationToken;
   const sales = await api.get('/api/sales');
+  if (renderToken !== navigationToken) return;
   view.innerHTML = `
     ${backLink('dashboard', 'Inicio')}
     <h2 class="section-title">Historial de ventas</h2>
@@ -1231,7 +1267,9 @@ async function renderHistory() {
 }
 
 async function renderSaleDetail(id) {
+  const renderToken = navigationToken;
   const sale = await api.get('/api/sales/' + id);
+  if (renderToken !== navigationToken) return;
   view.innerHTML = `
     ${backLink('historial', 'Historial')}
     <h2 class="section-title">${escapeHtml(sale.sale_number)}</h2>
@@ -1279,9 +1317,11 @@ function promptVoidSale(saleId) {
 
 // ---------------- SETTINGS ----------------
 async function renderSettings() {
+  const renderToken = navigationToken;
   let usersHtml = '';
   if (CURRENT_USER.role === 'admin') {
     const users = await api.get('/api/users');
+    if (renderToken !== navigationToken) return;
     usersHtml = `
       <h3>Usuarios</h3>
       ${users.map((u) => `
@@ -1301,7 +1341,7 @@ async function renderSettings() {
       <p><strong>${escapeHtml(CURRENT_USER.fullName)}</strong></p>
       <p class="meta">Usuario: @${escapeHtml(CURRENT_USER.username)} · Rol: ${CURRENT_USER.role}</p>
     </div>
-    ${CURRENT_USER.role === 'admin' ? `
+    ${CURRENT_USER.role === 'admin' && CURRENT_USER.canResetData ? `
       <div class="card danger-zone" style="margin-bottom:20px">
         <h3>Restablecer datos de prueba</h3>
         <p class="helper-text">Borra productos, inventario, ventas, movimientos y categorías actuales. Conserva los usuarios para que puedas volver a entrar y restaura las categorías iniciales.</p>
@@ -1415,7 +1455,7 @@ async function renderReports() {
     </div>
     <div id="reportBody" class="loading">Cargando…</div>
   `;
-  loadReportBody();
+  await loadReportBody();
 }
 
 function setReportPreset(preset) {
@@ -1425,17 +1465,28 @@ function setReportPreset(preset) {
 
 async function loadReportBody() {
   const { from, to } = reportRange;
+  const renderToken = navigationToken;
   const qs = `?from=${from}&to=${to}`;
-  const [overview, timeline, topProducts, byCategory, paymentSummary, movements] = await Promise.all([
-    api.get('/api/reports/overview' + qs),
-    api.get('/api/reports/sales-timeline' + qs + '&groupBy=day'),
-    api.get('/api/reports/top-products' + qs + '&limit=8'),
-    api.get('/api/reports/by-category' + qs),
-    api.get('/api/reports/payment-summary' + qs),
-    api.get('/api/reports/movements' + qs),
-  ]);
+  let overview; let timeline; let topProducts; let byCategory; let paymentSummary; let movements;
+  try {
+    [overview, timeline, topProducts, byCategory, paymentSummary, movements] = await Promise.all([
+      api.get('/api/reports/overview' + qs),
+      api.get('/api/reports/sales-timeline' + qs + '&groupBy=day'),
+      api.get('/api/reports/top-products' + qs + '&limit=8'),
+      api.get('/api/reports/by-category' + qs),
+      api.get('/api/reports/payment-summary' + qs),
+      api.get('/api/reports/movements' + qs),
+    ]);
+  } catch (error) {
+    const failedContainer = document.getElementById('reportBody');
+    if (failedContainer && renderToken === navigationToken && from === reportRange.from && to === reportRange.to) {
+      failedContainer.innerHTML = '<div class="empty-state"><p>No se pudieron cargar los informes.</p><button class="btn btn-outline" onclick="loadReportBody()">Reintentar</button></div>';
+    }
+    return;
+  }
 
   const container = document.getElementById('reportBody');
+  if (!container || renderToken !== navigationToken || from !== reportRange.from || to !== reportRange.to) return;
   container.innerHTML = `
     <div class="stat-grid">
       <div class="card stat-card"><div class="label">Ingresos</div><div class="value">${fmtMoney(overview.revenue)}</div></div>

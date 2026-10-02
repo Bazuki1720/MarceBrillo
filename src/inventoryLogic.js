@@ -3,6 +3,10 @@ const { toCents, fromCents } = require('./money');
 const MAX_STOCK_QUANTITY = 2147483647;
 const MAX_MONEY_CENTS = 999999999999;
 
+function orderItemsByVariantId(items) {
+  return [...items].sort((left, right) => Number(left.variantId) - Number(right.variantId));
+}
+
 async function genSaleNumber(client) {
   await client.query('SELECT pg_advisory_xact_lock($1)', [1874501]);
   const { rows } = await client.query('SELECT COUNT(*)::int as c FROM sales');
@@ -81,8 +85,9 @@ async function createSale(items, userId, paymentMethod = 'no_especificado', paym
     err.statusCode = 400;
     throw err;
   }
+  const orderedItems = orderItemsByVariantId(items);
   return withTransaction(async (client) => {
-    const totalCents = items.reduce((sum, item) => {
+    const totalCents = orderedItems.reduce((sum, item) => {
       const subtotalCents = toCents(item.unitPrice) * item.quantity;
       if (!Number.isSafeInteger(subtotalCents) || subtotalCents > MAX_MONEY_CENTS || sum > MAX_MONEY_CENTS - subtotalCents) {
         const err = new Error('TOTAL_FUERA_DE_RANGO');
@@ -100,7 +105,7 @@ async function createSale(items, userId, paymentMethod = 'no_especificado', paym
     );
     const saleId = saleRes.rows[0].id;
 
-    for (const it of items) {
+    for (const it of orderedItems) {
       const statusRes = await client.query(
         `SELECT p.status FROM product_variants pv JOIN products p ON p.id = pv.product_id WHERE pv.id = $1`,
         [it.variantId]
@@ -150,7 +155,7 @@ async function voidSale(saleId, userId, reason) {
       err.code = 'VENTA_YA_ANULADA';
       throw err;
     }
-    const itemsRes = await client.query('SELECT * FROM sale_items WHERE sale_id = $1', [saleId]);
+    const itemsRes = await client.query('SELECT * FROM sale_items WHERE sale_id = $1 ORDER BY variant_id, id', [saleId]);
     for (const it of itemsRes.rows) {
       await recordMovement(client, {
         variantId: it.variant_id,
@@ -190,12 +195,12 @@ async function getReservedQuantityForVariant(client, variantId) {
        FROM separated_order_items soi
        JOIN separated_orders so ON so.id = soi.separated_order_id
        WHERE soi.variant_id = $1 AND so.status = 'activo'
-       FOR UPDATE OF soi, so`
+       `
      : `SELECT soi.quantity, soi.retired_quantity AS withdrawn
        FROM separated_order_items soi
        JOIN separated_orders so ON so.id = soi.order_id
        WHERE soi.variant_id = $1 AND so.status = 'activo'
-       FOR UPDATE OF soi, so`;
+       `;
     const { rows } = await client.query(query, [variantId]);
     return rows.reduce((reserved, row) => reserved + Math.max(Number(row.quantity || 0) - Number(row.withdrawn || 0), 0), 0);
 }
@@ -204,11 +209,12 @@ async function getAvailableQuantityForVariant(client, variantId) {
     const inventoryRes = await client.query('SELECT COALESCE(quantity, 0)::int AS quantity FROM inventory WHERE variant_id = $1 FOR UPDATE', [variantId]);
   const physical = Number(inventoryRes.rows[0]?.quantity || 0);
   const reserved = await getReservedQuantityForVariant(client, variantId);
-  return physical - reserved;
+  return Math.max(physical - reserved, 0);
 }
 
 module.exports = {
   getOrCreateVariant,
+  orderItemsByVariantId,
   recordMovement,
   createSale,
   voidSale,
