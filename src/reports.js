@@ -1,18 +1,51 @@
 const { pool } = require('./db');
 
+function businessDate(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Bogota',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(date);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+function shiftDate(day, amount) {
+  const date = new Date(`${day}T00:00:00Z`);
+  date.setUTCDate(date.getUTCDate() + amount);
+  return date.toISOString().slice(0, 10);
+}
+
 // Normalizes optional from/to query params into a safe date range.
 // Defaults to the last 30 days (inclusive of today) when not provided.
 function resolveRange(from, to) {
-  const toDate = to ? new Date(to + 'T23:59:59') : new Date();
-  const fromDate = from ? new Date(from + 'T00:00:00') : new Date(toDate.getTime() - 29 * 24 * 60 * 60 * 1000);
-  return { fromDate, toDate };
+  const today = businessDate();
+  for (const day of [from, to].filter(Boolean)) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || !Number.isFinite(Date.parse(`${day}T00:00:00Z`)) || new Date(`${day}T00:00:00Z`).toISOString().slice(0, 10) !== day) {
+      const error = new Error('El rango de fechas no es válido');
+      error.statusCode = 400;
+      throw error;
+    }
+  }
+  const toDay = to || today;
+  const fromDay = from || shiftDate(toDay, -29);
+  if (fromDay > toDay) {
+    const error = new Error('La fecha inicial no puede ser posterior a la fecha final');
+    error.statusCode = 400;
+    throw error;
+  }
+  return {
+    fromDate: new Date(`${fromDay}T00:00:00-05:00`),
+    toDate: new Date(`${toDay}T23:59:59.999-05:00`),
+  };
 }
 
 async function salesSummary(from, to, groupBy) {
   const { fromDate, toDate } = resolveRange(from, to);
   const bucket = groupBy === 'month' ? 'month' : groupBy === 'week' ? 'week' : 'day';
   const { rows } = await pool.query(
-    `SELECT date_trunc($3, created_at) as period,
+    `SELECT date_trunc($3, created_at AT TIME ZONE 'America/Bogota') as period,
             COALESCE(SUM(total), 0) as total,
             COUNT(*)::int as sale_count
      FROM sales
@@ -128,4 +161,4 @@ async function inventoryValue() {
   return { totalValue: Number(rows[0].total_value), totalUnits: rows[0].total_units };
 }
 
-module.exports = { salesSummary, totals, topProducts, byCategory, paymentSummary, movementsSummary, inventoryValue, resolveRange };
+module.exports = { salesSummary, totals, topProducts, byCategory, paymentSummary, movementsSummary, inventoryValue, resolveRange, businessDate };

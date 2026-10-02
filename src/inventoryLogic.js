@@ -1,6 +1,10 @@
 const { pool, withTransaction } = require('./db');
+const { toCents, fromCents } = require('./money');
+const MAX_STOCK_QUANTITY = 2147483647;
+const MAX_MONEY_CENTS = 999999999999;
 
 async function genSaleNumber(client) {
+  await client.query('SELECT pg_advisory_xact_lock($1)', [1874501]);
   const { rows } = await client.query('SELECT COUNT(*)::int as c FROM sales');
   const n = rows[0].c + 1;
   const ymd = new Date().toISOString().slice(0, 10).replace(/-/g, '');
@@ -27,6 +31,10 @@ async function getOrCreateVariant(client, productId, size) {
 // Applies a signed quantity change to a variant's stock and logs the movement.
 // Must be called with a client that is inside an active transaction.
 async function recordMovement(client, { variantId, type, quantityChange, reason, saleId, userId }) {
+  await client.query(
+    'INSERT INTO inventory (variant_id, quantity) VALUES ($1, 0) ON CONFLICT (variant_id) DO NOTHING',
+    [variantId]
+  );
   const invRes = await client.query('SELECT quantity FROM inventory WHERE variant_id = $1 FOR UPDATE', [variantId]);
   const current = invRes.rows[0] ? invRes.rows[0].quantity : 0;
   const newQty = current + quantityChange;
@@ -34,6 +42,12 @@ async function recordMovement(client, { variantId, type, quantityChange, reason,
     const err = new Error('STOCK_INSUFICIENTE');
     err.code = 'STOCK_INSUFICIENTE';
     err.available = current;
+    throw err;
+  }
+  if (!Number.isInteger(quantityChange) || newQty > MAX_STOCK_QUANTITY) {
+    const err = new Error('CANTIDAD_FUERA_DE_RANGO');
+    err.code = 'CANTIDAD_FUERA_DE_RANGO';
+    err.statusCode = 400;
     throw err;
   }
 
@@ -61,8 +75,24 @@ async function createSale(items, userId, paymentMethod = 'no_especificado', paym
     err.code = 'CARRITO_VACIO';
     throw err;
   }
+  if (items.some((item) => !Number.isInteger(item.quantity) || item.quantity <= 0 || item.quantity > MAX_STOCK_QUANTITY || !Number.isFinite(item.unitPrice) || item.unitPrice < 0)) {
+    const err = new Error('PRODUCTO_O_PRECIO_INVALIDO');
+    err.code = 'PRODUCTO_O_PRECIO_INVALIDO';
+    err.statusCode = 400;
+    throw err;
+  }
   return withTransaction(async (client) => {
-    const total = items.reduce((sum, it) => sum + it.unitPrice * it.quantity, 0);
+    const totalCents = items.reduce((sum, item) => {
+      const subtotalCents = toCents(item.unitPrice) * item.quantity;
+      if (!Number.isSafeInteger(subtotalCents) || subtotalCents > MAX_MONEY_CENTS || sum > MAX_MONEY_CENTS - subtotalCents) {
+        const err = new Error('TOTAL_FUERA_DE_RANGO');
+        err.code = 'TOTAL_FUERA_DE_RANGO';
+        err.statusCode = 400;
+        throw err;
+      }
+      return sum + subtotalCents;
+    }, 0);
+    const total = fromCents(totalCents);
     const saleNumber = await genSaleNumber(client);
     const saleRes = await client.query(
       'INSERT INTO sales (sale_number, user_id, total, payment_method, payment_destination, status) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
@@ -91,7 +121,7 @@ async function createSale(items, userId, paymentMethod = 'no_especificado', paym
       await client.query(
         `INSERT INTO sale_items (sale_id, variant_id, product_reference, product_name, category_id, size, quantity, unit_price, subtotal)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-        [saleId, it.variantId, it.productReference, it.productName, it.categoryId || null, it.size || null, it.quantity, it.unitPrice, it.unitPrice * it.quantity]
+        [saleId, it.variantId, it.productReference, it.productName, it.categoryId || null, it.size || null, it.quantity, fromCents(toCents(it.unitPrice)), fromCents(toCents(it.unitPrice) * it.quantity)]
       );
       await recordMovement(client, {
         variantId: it.variantId,
@@ -167,7 +197,7 @@ async function getReservedQuantityForVariant(client, variantId) {
        WHERE soi.variant_id = $1 AND so.status = 'activo'
        FOR UPDATE OF soi, so`;
     const { rows } = await client.query(query, [variantId]);
-    return rows.reduce((reserved, row) => reserved + Number(row.quantity || 0) - Number(row.withdrawn || 0), 0);
+    return rows.reduce((reserved, row) => reserved + Math.max(Number(row.quantity || 0) - Number(row.withdrawn || 0), 0), 0);
 }
 
 async function getAvailableQuantityForVariant(client, variantId) {

@@ -3,12 +3,19 @@ const path = require('path');
 const express = require('express');
 const session = require('express-session');
 const bcrypt = require('bcryptjs');
-const { pool, initSchema, withTransaction } = require('./db');
+const { pool, changeListenerPool, changeNotificationsSupported, initSchema, withTransaction } = require('./db');
 const { requireAuth, requireAdmin } = require('./auth');
 const { getOrCreateVariant, recordMovement, createSale, voidSale, getAvailableQuantityForVariant, getReservedQuantityForVariant } = require('./inventoryLogic');
 const reports = require('./reports');
+const { toCents, fromCents } = require('./money');
+const MAX_STOCK_QUANTITY = 2147483647;
+const MAX_MONEY_CENTS = 999999999999;
 
 const app = express();
+const CHANGE_CHANNEL = 'marce_brillo_changes';
+const changeSubscribers = new Set();
+let changeListenerClient = null;
+let changeListenerRetryTimer = null;
 app.use(express.json());
 app.use(
   session({
@@ -28,6 +35,47 @@ function h(fn) {
     const statusCode = Number.isInteger(err.statusCode) && err.statusCode >= 400 && err.statusCode < 500 ? err.statusCode : 500;
     res.status(statusCode).json({ error: statusCode < 500 ? err.message : 'Error interno del servidor' });
   });
+}
+
+function scheduleChangeListenerRetry() {
+  if (changeListenerRetryTimer) return;
+  changeListenerRetryTimer = setTimeout(() => {
+    changeListenerRetryTimer = null;
+    startChangeListener();
+  }, 5000);
+  changeListenerRetryTimer.unref?.();
+}
+
+async function startChangeListener() {
+  if (changeListenerClient || !changeNotificationsSupported) return;
+  let client;
+  let released = false;
+  const releaseClient = (error) => {
+    if (changeListenerClient === client) changeListenerClient = null;
+    if (client && !released) {
+      released = true;
+      client.release(true);
+    }
+    if (error) console.error('Se perdió el listener de cambios en tiempo real:', error.message);
+    scheduleChangeListenerRetry();
+  };
+
+  try {
+    client = await changeListenerPool.connect();
+    client.on('notification', (notification) => {
+      if (notification.channel !== CHANGE_CHANNEL) return;
+      const payload = JSON.stringify({ table: notification.payload, updatedAt: Date.now() });
+      for (const subscriber of changeSubscribers) {
+        try { subscriber.write(`event: change\ndata: ${payload}\n\n`); }
+        catch (error) { changeSubscribers.delete(subscriber); }
+      }
+    });
+    client.on('error', releaseClient);
+    changeListenerClient = client;
+    await client.query(`LISTEN ${CHANGE_CHANNEL}`);
+  } catch (error) {
+    releaseClient(error);
+  }
 }
 
 // ---------- AUTH ----------
@@ -53,6 +101,23 @@ app.post('/api/logout', (req, res) => {
 app.get('/api/me', (req, res) => {
   if (!req.session.userId) return res.status(401).json({ error: 'No autenticado' });
   res.json({ userId: req.session.userId, username: req.session.username, fullName: req.session.fullName, role: req.session.role });
+});
+
+app.get('/api/events', requireAuth, (req, res) => {
+  res.set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  res.flushHeaders();
+  res.write('event: connected\ndata: {}\n\n');
+  changeSubscribers.add(res);
+  const heartbeat = setInterval(() => res.write(': keep-alive\n\n'), 25000);
+  res.on('close', () => {
+    clearInterval(heartbeat);
+    changeSubscribers.delete(res);
+  });
 });
 
 // ---------- USERS (admin only) ----------
@@ -101,6 +166,7 @@ app.post('/api/admin/reset-data', requireAuth, requireAdmin, h(async (req, res) 
       `INSERT INTO categories (name) VALUES ($1), ($2), ($3), ($4), ($5)`,
       ['Calzado', 'Bolsos', 'Accesorios', 'Camisetas', 'Otros']
     );
+    await client.query("SELECT pg_notify('marce_brillo_changes', 'reset')");
   });
   res.json({ ok: true });
 }));
@@ -125,14 +191,26 @@ app.post('/api/categories', requireAuth, h(async (req, res) => {
 
 // ---------- PRODUCTS ----------
 async function serializeProduct(product) {
+  const { modern } = await getSeparatedSchemaInfo();
+  const orderIdColumn = modern ? 'separated_order_id' : 'order_id';
+  const withdrawnColumn = modern ? 'quantity_withdrawn' : 'retired_quantity';
   const variantsRes = await pool.query(
-    `SELECT pv.id as variant_id, pv.size, COALESCE(i.quantity, 0) as quantity
+    `SELECT pv.id as variant_id, pv.size, COALESCE(i.quantity, 0)::int as quantity,
+            GREATEST(COALESCE(i.quantity, 0) - COALESCE(r.reserved, 0), 0)::int AS available_quantity
      FROM product_variants pv LEFT JOIN inventory i ON i.variant_id = pv.id
+     LEFT JOIN (
+      SELECT soi.variant_id, SUM(GREATEST(soi.quantity - soi.${withdrawnColumn}, 0)) AS reserved
+       FROM separated_order_items soi
+       JOIN separated_orders so ON so.id = soi.${orderIdColumn}
+       WHERE so.status = 'activo'
+       GROUP BY soi.variant_id
+     ) r ON r.variant_id = pv.id
      WHERE pv.product_id = $1 ORDER BY pv.id`,
     [product.id]
   );
   const variants = variantsRes.rows;
   const totalStock = variants.reduce((s, v) => s + v.quantity, 0);
+  const totalAvailable = variants.reduce((sum, variant) => sum + variant.available_quantity, 0);
   const catRes = await pool.query('SELECT name FROM categories WHERE id = $1', [product.category_id]);
   return {
     ...product,
@@ -140,6 +218,7 @@ async function serializeProduct(product) {
     category_name: catRes.rows[0] ? catRes.rows[0].name : null,
     variants,
     total_stock: totalStock,
+    total_available: totalAvailable,
   };
 }
 
@@ -181,6 +260,18 @@ async function getSeparatedSchemaInfo(client = pool) {
     modern: orders.has('separation_number') && orders.has('customer_name') && orders.has('customer_phone') && orders.has('user_id')
       && items.has('separated_order_id') && items.has('quantity_withdrawn')
       && (!payments.size || payments.has('separated_order_id')),
+  };
+}
+
+async function getCreditSchemaInfo(client = pool) {
+  const { rows } = await client.query(`
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_name = 'credit_sales'
+  `);
+  const columns = new Set(rows.map((row) => row.column_name));
+  return {
+    modern: columns.has('customer_name') && columns.has('customer_phone') && columns.has('user_id'),
   };
 }
 
@@ -244,12 +335,13 @@ async function getSeparatedOrderPayload(client, orderId) {
 }
 
 async function getCreditSalePayload(client, creditId) {
+  const { modern } = await getCreditSchemaInfo(client);
   const creditRes = await client.query(
     `SELECT cs.*, u.full_name AS created_by_name,
-            cs.customer_name AS client_name,
-            cs.customer_phone AS phone
+            ${modern ? 'cs.customer_name' : 'cs.client_name'} AS client_name,
+            ${modern ? 'cs.customer_phone' : 'cs.phone'} AS phone
      FROM credit_sales cs
-     JOIN users u ON u.id = cs.user_id
+     JOIN users u ON u.id = cs.${modern ? 'user_id' : 'created_by'}
      WHERE cs.id = $1`,
     [creditId]
   );
@@ -280,6 +372,9 @@ async function getCreditSalePayload(client, creditId) {
 
 app.get('/api/products', requireAuth, h(async (req, res) => {
   const { q } = req.query;
+  const { modern } = await getSeparatedSchemaInfo();
+  const orderIdColumn = modern ? 'separated_order_id' : 'order_id';
+  const withdrawnColumn = modern ? 'quantity_withdrawn' : 'retired_quantity';
   const params = [];
   let filter = '';
   if (q && q.trim()) {
@@ -293,7 +388,8 @@ app.get('/api/products', requireAuth, h(async (req, res) => {
                 json_build_object(
                   'variant_id', pv.id,
                   'size', pv.size,
-                  'quantity', COALESCE(i.quantity, 0)
+                  'quantity', COALESCE(i.quantity, 0),
+                  'available_quantity', GREATEST(COALESCE(i.quantity, 0) - COALESCE(r.reserved, 0), 0)
                 ) ORDER BY pv.id
               ) FILTER (WHERE pv.id IS NOT NULL), '[]'::json
             ) AS variants,
@@ -302,17 +398,24 @@ app.get('/api/products', requireAuth, h(async (req, res) => {
      LEFT JOIN categories c ON c.id = p.category_id
      LEFT JOIN product_variants pv ON pv.product_id = p.id
      LEFT JOIN inventory i ON i.variant_id = pv.id
+     LEFT JOIN (
+      SELECT soi.variant_id, SUM(GREATEST(soi.quantity - soi.${withdrawnColumn}, 0)) AS reserved
+       FROM separated_order_items soi
+       JOIN separated_orders so ON so.id = soi.${orderIdColumn}
+       WHERE so.status = 'activo'
+       GROUP BY soi.variant_id
+     ) r ON r.variant_id = pv.id
      ${filter}
      GROUP BY p.id, c.name
      ORDER BY p.name`,
     params
   );
-  const products = await Promise.all(rows.map(async (product) => {
-    const variants = await Promise.all((product.variants || []).map(async (variant) => ({
+  const products = rows.map((product) => {
+    const variants = (product.variants || []).map((variant) => ({
       ...variant,
       quantity: Number(variant.quantity || 0),
-      available_quantity: Math.max(0, await getAvailableQuantityForVariant(pool, variant.variant_id)),
-    })));
+      available_quantity: Number(variant.available_quantity || 0),
+    }));
     return {
       ...product,
       price: Number(product.price),
@@ -320,7 +423,7 @@ app.get('/api/products', requireAuth, h(async (req, res) => {
       total_stock: Number(product.total_stock),
       total_available: variants.reduce((sum, variant) => sum + variant.available_quantity, 0),
     };
-  }));
+  });
   res.json(products);
 }));
 
@@ -422,39 +525,50 @@ app.post('/api/separados', requireAuth, h(async (req, res) => {
     return res.status(400).json({ error: 'El teléfono no es válido' });
   }
   const paymentAmount = Number(initialPayment || 0);
-  if (paymentAmount < 0) return res.status(400).json({ error: 'El abono inicial no puede ser negativo' });
+  if (!Number.isFinite(paymentAmount) || paymentAmount < 0) return res.status(400).json({ error: 'El abono inicial no puede ser negativo ni inválido' });
+  if (dueAt && Number.isNaN(new Date(dueAt).getTime())) return res.status(400).json({ error: 'La fecha límite no es válida' });
+  const paymentCents = toCents(paymentAmount);
+  if (paymentCents > MAX_MONEY_CENTS) return res.status(400).json({ error: 'El abono inicial supera el valor máximo permitido' });
 
   const { modern: useModernSeparatedSchema } = await getSeparatedSchemaInfo();
 
   const result = await withTransaction(async (client) => {
-    let total = 0;
+    let totalCents = 0;
     const preparedItems = [];
     const requestedByVariant = new Map();
     for (const item of items) {
       const qty = Number(item.quantity);
-      if (!qty || qty <= 0) throw Object.assign(new Error('Cantidad inválida en el separado'), { statusCode: 400 });
+      if (!Number.isInteger(qty) || qty <= 0 || qty > MAX_STOCK_QUANTITY) throw Object.assign(new Error('Cantidad inválida en el separado'), { statusCode: 400 });
       const variant = await getVariantContext(client, Number(item.variantId));
       const requested = (requestedByVariant.get(variant.id) || 0) + qty;
       await ensureAvailableForVariant(client, variant.id, requested, `${variant.reference}${variant.size ? ' talla ' + variant.size : ''}`);
       requestedByVariant.set(variant.id, requested);
-      const unitPrice = Number(item.unitPrice ?? variant.price);
-      if (!Number.isFinite(unitPrice) || unitPrice < 0) throw Object.assign(new Error('Precio inválido para el separado'), { statusCode: 400 });
-      const subtotal = qty * unitPrice;
-      total += subtotal;
+      const rawUnitPrice = Number(item.unitPrice ?? variant.price);
+      if (!Number.isFinite(rawUnitPrice) || rawUnitPrice < 0) throw Object.assign(new Error('Precio inválido para el separado'), { statusCode: 400 });
+      const unitPriceCents = toCents(rawUnitPrice);
+      const subtotalCents = qty * unitPriceCents;
+      if (!Number.isSafeInteger(subtotalCents) || subtotalCents > MAX_MONEY_CENTS || totalCents > MAX_MONEY_CENTS - subtotalCents) {
+        throw Object.assign(new Error('El total del separado supera el valor máximo permitido'), { statusCode: 400 });
+      }
+      totalCents += subtotalCents;
       preparedItems.push({
         variantId: variant.id,
         quantity: qty,
-        unitPrice,
-        subtotal,
+        unitPrice: fromCents(unitPriceCents),
+        subtotal: fromCents(subtotalCents),
         productReference: variant.reference,
         productName: variant.product_name,
         size: variant.size,
       });
     }
-    if (paymentAmount > total) throw Object.assign(new Error('El abono inicial no puede superar el total'), { statusCode: 400 });
+    const total = fromCents(totalCents);
+    if (paymentCents > totalCents) throw Object.assign(new Error('El abono inicial no puede superar el total'), { statusCode: 400 });
 
+    await client.query('SELECT pg_advisory_xact_lock($1)', [1874502]);
     const countRes = await client.query('SELECT COUNT(*)::int AS c FROM separated_orders');
-    const dueDate = dueAt ? new Date(dueAt) : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+    const dueDate = dueAt
+      ? new Date(/^\d{4}-\d{2}-\d{2}$/.test(dueAt) ? `${dueAt}T23:59:59.999-05:00` : dueAt)
+      : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
     const orderNumber = `SEP-${String(countRes.rows[0].c + 1).padStart(5, '0')}`;
 
     const orderQuery = useModernSeparatedSchema
@@ -491,16 +605,17 @@ app.post('/api/separados', requireAuth, h(async (req, res) => {
       ]);
     }
 
-    if (paymentAmount > 0) {
+    const normalizedPayment = fromCents(paymentCents);
+    if (paymentCents > 0) {
       const paymentQuery = useModernSeparatedSchema
         ? `INSERT INTO separated_payments (separated_order_id, amount, payment_method, user_id, note)
            VALUES ($1, $2, $3, $4, $5)`
         : `INSERT INTO separated_payments (order_id, amount, payment_method, user_id, note)
            VALUES ($1, $2, $3, $4, $5)`;
-      await client.query(paymentQuery, [orderId, paymentAmount, 'efectivo', req.session.userId, 'Abono inicial']);
+      await client.query(paymentQuery, [orderId, normalizedPayment, 'efectivo', req.session.userId, 'Abono inicial']);
     }
 
-    return { orderId, orderNumber, total, paidAmount: paymentAmount, status: 'activo', due_at: dueDate.toISOString() };
+    return { orderId, orderNumber, total, paidAmount: normalizedPayment, status: 'activo', due_at: dueDate.toISOString() };
   });
 
   res.json(result);
@@ -509,7 +624,8 @@ app.post('/api/separados', requireAuth, h(async (req, res) => {
 app.post('/api/separados/:id/pagos', requireAuth, h(async (req, res) => {
   const { amount, method = 'efectivo', note } = req.body || {};
   const numericAmount = Number(amount);
-  if (!numericAmount || numericAmount <= 0) return res.status(400).json({ error: 'El valor del abono debe ser mayor a cero' });
+  const amountCents = toCents(numericAmount);
+  if (!Number.isFinite(numericAmount) || amountCents <= 0 || amountCents > MAX_MONEY_CENTS) return res.status(400).json({ error: 'El valor del abono debe ser mayor a cero y estar dentro del límite permitido' });
   const payment = await withTransaction(async (client) => {
     const { modern } = await getSeparatedSchemaInfo(client);
     const order = await client.query('SELECT * FROM separated_orders WHERE id = $1 FOR UPDATE', [req.params.id]);
@@ -522,16 +638,16 @@ app.post('/api/separados/:id/pagos', requireAuth, h(async (req, res) => {
       [req.params.id]
     )).rows[0].total || 0);
     const total = Number(order.rows[0].total || 0);
-    if (numericAmount > total - currentPaid) throw Object.assign(new Error('El abono no puede superar el saldo del separado'), { statusCode: 400 });
+    if (amountCents > toCents(total - currentPaid)) throw Object.assign(new Error('El abono no puede superar el saldo del separado'), { statusCode: 400 });
     const { rows } = await client.query(
       modern
         ? `INSERT INTO separated_payments (separated_order_id, amount, payment_method, user_id, note)
            VALUES ($1, $2, $3, $4, $5) RETURNING *`
         : `INSERT INTO separated_payments (order_id, amount, payment_method, user_id, note)
            VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [req.params.id, numericAmount, method, req.session.userId, note || null]
+      [req.params.id, fromCents(amountCents), method, req.session.userId, note || null]
     );
-    if (!modern) await client.query('UPDATE separated_orders SET paid_amount = paid_amount + $1 WHERE id = $2', [numericAmount, req.params.id]);
+    if (!modern) await client.query('UPDATE separated_orders SET paid_amount = paid_amount + $1 WHERE id = $2', [fromCents(amountCents), req.params.id]);
     return rows[0];
   });
   res.json({ ok: true, payment: { ...payment, amount: Number(payment.amount) } });
@@ -539,7 +655,7 @@ app.post('/api/separados/:id/pagos', requireAuth, h(async (req, res) => {
 
 app.post('/api/separados/:id/retiro', requireAuth, h(async (req, res) => {
   const quantityToRetire = Number(req.body?.quantity ?? 0);
-  if (!quantityToRetire || quantityToRetire <= 0) return res.status(400).json({ error: 'La cantidad a retirar debe ser mayor a cero' });
+  if (!Number.isInteger(quantityToRetire) || quantityToRetire <= 0) return res.status(400).json({ error: 'La cantidad a retirar debe ser un entero mayor a cero' });
 
   const result = await withTransaction(async (client) => {
     const { modern } = await getSeparatedSchemaInfo(client);
@@ -552,7 +668,7 @@ app.post('/api/separados/:id/retiro', requireAuth, h(async (req, res) => {
       [order.id]
     );
     let remaining = quantityToRetire;
-    for (const item of itemsRes) {
+    for (const item of itemsRes.rows) {
       const availableToRetire = Number((modern ? item.quantity - item.quantity_withdrawn : item.quantity - item.retired_quantity) || 0);
       if (availableToRetire <= 0) continue;
       const toRetire = Math.min(remaining, availableToRetire);
@@ -612,19 +728,23 @@ app.post('/api/separados/:id/anular', requireAuth, h(async (req, res) => {
 
 app.get('/api/fiados', requireAuth, h(async (req, res) => {
   const { q } = req.query;
+  const { modern } = await getCreditSchemaInfo();
+  const customerNameColumn = modern ? 'customer_name' : 'client_name';
+  const customerPhoneColumn = modern ? 'customer_phone' : 'phone';
+  const userIdColumn = modern ? 'user_id' : 'created_by';
   let sql = `
     SELECT DISTINCT ON (cs.id) cs.*, u.full_name AS created_by_name,
-      cs.customer_name AS client_name,
-      cs.customer_phone AS phone,
+      cs.${customerNameColumn} AS client_name,
+      cs.${customerPhoneColumn} AS phone,
       COALESCE((SELECT SUM(cp.amount) FROM credit_payments cp WHERE cp.credit_sale_id = cs.id), 0)::numeric AS paid_amount
     FROM credit_sales cs
-    JOIN users u ON u.id = cs.user_id
+    JOIN users u ON u.id = cs.${userIdColumn}
     LEFT JOIN credit_sale_items csi ON csi.credit_sale_id = cs.id
   `;
   const params = [];
   if (q && q.trim()) {
     params.push(`%${q.trim()}%`);
-    sql += ` WHERE cs.customer_name ILIKE $1 OR cs.customer_phone ILIKE $1 OR csi.product_reference ILIKE $1 OR csi.product_name ILIKE $1`;
+    sql += ` WHERE cs.${customerNameColumn} ILIKE $1 OR cs.${customerPhoneColumn} ILIKE $1 OR csi.product_reference ILIKE $1 OR csi.product_name ILIKE $1`;
   }
   sql += ' ORDER BY cs.id DESC, cs.created_at DESC';
   const { rows } = await pool.query(sql, params);
@@ -637,28 +757,9 @@ app.get('/api/fiados', requireAuth, h(async (req, res) => {
 }));
 
 app.get('/api/fiados/:id', requireAuth, h(async (req, res) => {
-  const creditRes = await pool.query(
-    `SELECT cs.*, u.full_name AS created_by_name,
-            cs.customer_name AS client_name,
-            cs.customer_phone AS phone
-     FROM credit_sales cs
-     JOIN users u ON u.id = cs.user_id
-     WHERE cs.id = $1`,
-    [req.params.id]
-  );
-  const credit = creditRes.rows[0];
+  const credit = await getCreditSalePayload(pool, req.params.id);
   if (!credit) return res.status(404).json({ error: 'Fiado no encontrado' });
-  const itemsRes = await pool.query('SELECT * FROM credit_sale_items WHERE credit_sale_id = $1 ORDER BY id', [req.params.id]);
-  const paymentsRes = await pool.query('SELECT * FROM credit_payments WHERE credit_sale_id = $1 ORDER BY created_at DESC', [req.params.id]);
-  const paidAmount = paymentsRes.rows.reduce((sum, item) => sum + Number(item.amount || 0), 0);
-  res.json({
-    ...credit,
-    total: Number(credit.total),
-    paid_amount: paidAmount,
-    balance: Number(credit.total) - paidAmount,
-    items: itemsRes.rows.map((item) => ({ ...item, unit_price: Number(item.unit_price), subtotal: Number(item.subtotal) })),
-    payments: paymentsRes.rows.map((item) => ({ ...item, amount: Number(item.amount) })),
-  });
+  res.json(credit);
 }));
 
 app.post('/api/fiados', requireAuth, h(async (req, res) => {
@@ -670,39 +771,56 @@ app.post('/api/fiados', requireAuth, h(async (req, res) => {
     return res.status(400).json({ error: 'El teléfono no es válido' });
   }
   const paymentAmount = Number(initialPayment || 0);
-  if (paymentAmount < 0) return res.status(400).json({ error: 'El abono inicial no puede ser negativo' });
+  if (!Number.isFinite(paymentAmount) || paymentAmount < 0) return res.status(400).json({ error: 'El abono inicial no puede ser negativo ni inválido' });
+  const paymentCents = toCents(paymentAmount);
+  if (paymentCents > MAX_MONEY_CENTS) return res.status(400).json({ error: 'El abono inicial supera el valor máximo permitido' });
 
   const result = await withTransaction(async (client) => {
-    let total = 0;
+    const { modern } = await getCreditSchemaInfo(client);
+    let totalCents = 0;
     const preparedItems = [];
+    const requestedByVariant = new Map();
     for (const item of items) {
       const qty = Number(item.quantity);
       const unitPrice = Number(item.unitPrice ?? 0);
-      if (!qty || qty <= 0 || !Number.isFinite(unitPrice) || unitPrice < 0) {
+      if (!Number.isInteger(qty) || qty <= 0 || qty > MAX_STOCK_QUANTITY || !Number.isFinite(unitPrice) || unitPrice < 0) {
         throw Object.assign(new Error('Producto o precio inválido en el fiado'), { statusCode: 400 });
       }
       const variant = await getVariantContext(client, Number(item.variantId));
-      await ensureAvailableForVariant(client, variant.id, qty, `${variant.reference}${variant.size ? ' talla ' + variant.size : ''}`);
-      total += qty * unitPrice;
+      const requested = (requestedByVariant.get(variant.id) || 0) + qty;
+      await ensureAvailableForVariant(client, variant.id, requested, `${variant.reference}${variant.size ? ' talla ' + variant.size : ''}`);
+      requestedByVariant.set(variant.id, requested);
+      const unitPriceCents = toCents(unitPrice);
+      const subtotalCents = qty * unitPriceCents;
+      if (!Number.isSafeInteger(subtotalCents) || subtotalCents > MAX_MONEY_CENTS || totalCents > MAX_MONEY_CENTS - subtotalCents) {
+        throw Object.assign(new Error('El total del fiado supera el valor máximo permitido'), { statusCode: 400 });
+      }
+      totalCents += subtotalCents;
       preparedItems.push({
         variantId: variant.id,
         quantity: qty,
-        unitPrice,
-        subtotal: qty * unitPrice,
+        unitPrice: fromCents(unitPriceCents),
+        subtotal: fromCents(subtotalCents),
         productReference: variant.reference,
         productName: variant.product_name,
         size: variant.size,
       });
     }
-    if (paymentAmount > total) throw Object.assign(new Error('El abono inicial no puede superar el total del fiado'), { statusCode: 400 });
+    const total = fromCents(totalCents);
+    if (paymentCents > totalCents) throw Object.assign(new Error('El abono inicial no puede superar el total del fiado'), { statusCode: 400 });
 
+    await client.query('SELECT pg_advisory_xact_lock($1)', [1874503]);
     const countRes = await client.query('SELECT COUNT(*)::int AS c FROM credit_sales');
     const creditNumber = `FIA-${String(countRes.rows[0].c + 1).padStart(5, '0')}`;
     const creditRes = await client.query(
-      `INSERT INTO credit_sales (credit_number, customer_name, customer_phone, total, status, user_id)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING id`,
-      [creditNumber, clientName.trim(), phone.trim(), total, paymentAmount >= total ? 'pagado' : 'pendiente', req.session.userId]
+      modern
+        ? `INSERT INTO credit_sales (credit_number, customer_name, customer_phone, total, status, user_id)
+           VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`
+        : `INSERT INTO credit_sales (credit_number, client_name, phone, total, paid_amount, status, created_by)
+           VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+      modern
+        ? [creditNumber, clientName.trim(), phone.trim(), total, paymentCents >= totalCents ? 'pagado' : 'pendiente', req.session.userId]
+        : [creditNumber, clientName.trim(), phone.trim(), total, fromCents(paymentCents), paymentCents >= totalCents ? 'pagado' : 'pendiente', req.session.userId]
     );
     const creditId = creditRes.rows[0].id;
 
@@ -721,15 +839,15 @@ app.post('/api/fiados', requireAuth, h(async (req, res) => {
       });
     }
 
-    if (paymentAmount > 0) {
+    if (paymentCents > 0) {
       await client.query(
         `INSERT INTO credit_payments (credit_sale_id, amount, payment_method, user_id, note)
          VALUES ($1, $2, $3, $4, $5)`,
-        [creditId, paymentAmount, 'efectivo', req.session.userId, 'Abono inicial']
+        [creditId, fromCents(paymentCents), 'efectivo', req.session.userId, 'Abono inicial']
       );
     }
 
-    return { creditId, creditNumber, total, paidAmount: paymentAmount, status: paymentAmount >= total ? 'pagado' : 'pendiente' };
+    return { creditId, creditNumber, total, paidAmount: fromCents(paymentCents), status: paymentCents >= totalCents ? 'pagado' : 'pendiente' };
   });
 
   res.json(result);
@@ -738,8 +856,10 @@ app.post('/api/fiados', requireAuth, h(async (req, res) => {
 app.post('/api/fiados/:id/pagos', requireAuth, h(async (req, res) => {
   const { amount, method = 'efectivo', note } = req.body || {};
   const numericAmount = Number(amount);
-  if (!numericAmount || numericAmount <= 0) return res.status(400).json({ error: 'El valor del abono debe ser mayor a cero' });
+  const amountCents = toCents(numericAmount);
+  if (!Number.isFinite(numericAmount) || amountCents <= 0 || amountCents > MAX_MONEY_CENTS) return res.status(400).json({ error: 'El valor del abono debe ser mayor a cero y estar dentro del límite permitido' });
   const payment = await withTransaction(async (client) => {
+    const { modern } = await getCreditSchemaInfo(client);
     const credit = await client.query('SELECT * FROM credit_sales WHERE id = $1 FOR UPDATE', [req.params.id]);
     if (!credit.rows[0]) throw Object.assign(new Error('Fiado no encontrado'), { statusCode: 404 });
     if (credit.rows[0].status === 'anulado') throw Object.assign(new Error('Este fiado está anulado'), { statusCode: 400 });
@@ -748,14 +868,16 @@ app.post('/api/fiados/:id/pagos', requireAuth, h(async (req, res) => {
       [req.params.id]
     )).rows[0].total || 0);
     const total = Number(credit.rows[0].total || 0);
-    if (numericAmount > total - currentPaid) throw Object.assign(new Error('El abono no puede superar el saldo pendiente'), { statusCode: 400 });
+    if (amountCents > toCents(total - currentPaid)) throw Object.assign(new Error('El abono no puede superar el saldo pendiente'), { statusCode: 400 });
     const { rows } = await client.query(
       `INSERT INTO credit_payments (credit_sale_id, amount, payment_method, user_id, note) VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [req.params.id, numericAmount, method, req.session.userId, note || null]
+      [req.params.id, fromCents(amountCents), method, req.session.userId, note || null]
     );
-    const newPaid = currentPaid + numericAmount;
+    const newPaid = fromCents(toCents(currentPaid) + amountCents);
     await client.query(
-      `UPDATE credit_sales SET status = CASE WHEN $1 >= total THEN 'pagado' ELSE 'pendiente' END, paid_at = CASE WHEN $1 >= total THEN now() ELSE paid_at END WHERE id = $2`,
+      modern
+        ? `UPDATE credit_sales SET status = CASE WHEN $1 >= total THEN 'pagado' ELSE 'pendiente' END WHERE id = $2`
+        : `UPDATE credit_sales SET status = CASE WHEN $1 >= total THEN 'pagado' ELSE 'pendiente' END, paid_amount = $1 WHERE id = $2`,
       [newPaid, req.params.id]
     );
     return rows[0];
@@ -766,6 +888,7 @@ app.post('/api/fiados/:id/pagos', requireAuth, h(async (req, res) => {
 app.post('/api/fiados/:id/anular', requireAuth, h(async (req, res) => {
   const { reason } = req.body || {};
   await withTransaction(async (client) => {
+    const { modern } = await getCreditSchemaInfo(client);
     const credit = await client.query('SELECT * FROM credit_sales WHERE id = $1 FOR UPDATE', [req.params.id]);
     if (!credit.rows[0]) throw Object.assign(new Error('Fiado no encontrado'), { statusCode: 404 });
     if (credit.rows[0].status === 'anulado') throw Object.assign(new Error('Este fiado ya está anulado'), { statusCode: 400 });
@@ -780,7 +903,9 @@ app.post('/api/fiados/:id/anular', requireAuth, h(async (req, res) => {
       });
     }
     await client.query(
-      `UPDATE credit_sales SET status = 'anulado', voided_at = now(), voided_by = $1, void_reason = $2 WHERE id = $3`,
+      modern
+        ? `UPDATE credit_sales SET status = 'anulado', voided_at = now(), voided_by = $1, void_reason = $2 WHERE id = $3`
+        : `UPDATE credit_sales SET status = 'anulado', canceled_at = now(), canceled_by = $1, cancel_reason = $2 WHERE id = $3`,
       [req.session.userId, reason || null, req.params.id]
     );
   });
@@ -790,10 +915,34 @@ app.post('/api/fiados/:id/anular', requireAuth, h(async (req, res) => {
 app.post('/api/products', requireAuth, h(async (req, res) => {
   const { reference, name, categoryId, price, description, hasVariants, sizes, initialStock, lowStockThreshold } =
     req.body || {};
-  if (!reference || !name || !categoryId || price === undefined) {
+  const numericPrice = Number(price);
+  const numericCategoryId = Number(categoryId);
+  const numericThreshold = lowStockThreshold === undefined ? 3 : Number(lowStockThreshold);
+  if (typeof reference !== 'string' || !reference.trim() || typeof name !== 'string' || !name.trim()
+    || !Number.isInteger(numericCategoryId) || numericCategoryId <= 0 || price === undefined) {
     return res.status(400).json({ error: 'Referencia, nombre, categoría y precio son obligatorios' });
   }
-  if (Number(price) < 0) return res.status(400).json({ error: 'El precio no puede ser negativo' });
+  if (!Number.isFinite(numericPrice) || numericPrice < 0 || numericPrice > 9999999999.99) return res.status(400).json({ error: 'El precio no es válido' });
+  if (!Number.isInteger(numericThreshold) || numericThreshold < 0 || numericThreshold > 2147483647) return res.status(400).json({ error: 'El mínimo de inventario debe ser un entero no negativo' });
+  const usesVariants = hasVariants === true;
+  let normalizedSizes = [];
+  if (usesVariants) {
+    if (!Array.isArray(sizes) || sizes.length === 0) return res.status(400).json({ error: 'Agrega al menos una talla' });
+    const seenSizes = new Set();
+    for (const sizeEntry of sizes) {
+      const size = String(sizeEntry?.size ?? '').trim();
+      const quantity = Number(sizeEntry?.quantity);
+      const normalizedSize = size.toLocaleLowerCase();
+      if (!size || !Number.isInteger(quantity) || quantity < 0 || quantity > 2147483647 || seenSizes.has(normalizedSize)) {
+        return res.status(400).json({ error: 'Cada talla debe ser única y tener una cantidad entera no negativa' });
+      }
+      seenSizes.add(normalizedSize);
+      normalizedSizes.push({ size, quantity });
+    }
+  } else {
+    const quantity = Number(initialStock ?? 0);
+    if (!Number.isInteger(quantity) || quantity < 0 || quantity > 2147483647) return res.status(400).json({ error: 'El stock inicial debe ser un entero no negativo' });
+  }
 
   const { withTransaction } = require('./db');
   try {
@@ -804,19 +953,19 @@ app.post('/api/products', requireAuth, h(async (req, res) => {
         [
           reference.trim(),
           name.trim(),
-          categoryId,
-          price,
+          numericCategoryId,
+          numericPrice,
           description || null,
-          !!hasVariants,
-          lowStockThreshold ? Number(lowStockThreshold) : 3,
+          usesVariants,
+          numericThreshold,
         ]
       );
       const productId = insertRes.rows[0].id;
 
-      if (hasVariants && Array.isArray(sizes) && sizes.length > 0) {
-        for (const s of sizes) {
-          const size = String(s.size).trim();
-          const qty = Number(s.quantity) || 0;
+      if (usesVariants) {
+        for (const s of normalizedSizes) {
+          const size = s.size;
+          const qty = s.quantity;
           const variant = await getOrCreateVariant(client, productId, size);
           if (qty > 0) {
             await recordMovement(client, {
@@ -849,16 +998,26 @@ app.put('/api/products/:id', requireAuth, h(async (req, res) => {
   const { rows } = await pool.query('SELECT * FROM products WHERE id = $1', [req.params.id]);
   const product = rows[0];
   if (!product) return res.status(404).json({ error: 'Producto no encontrado' });
+  const nextName = name ?? product.name;
+  const nextCategoryId = Number(categoryId ?? product.category_id);
+  const nextPrice = Number(price ?? product.price);
+  const nextThreshold = Number(lowStockThreshold ?? product.low_stock_threshold);
+  const nextStatus = status ?? product.status;
+  if (typeof nextName !== 'string' || !nextName.trim()) return res.status(400).json({ error: 'El nombre del producto es obligatorio' });
+  if (!Number.isInteger(nextCategoryId) || nextCategoryId <= 0) return res.status(400).json({ error: 'La categoría no es válida' });
+  if (!Number.isFinite(nextPrice) || nextPrice < 0 || nextPrice > 9999999999.99) return res.status(400).json({ error: 'El precio no es válido' });
+  if (!Number.isInteger(nextThreshold) || nextThreshold < 0 || nextThreshold > 2147483647) return res.status(400).json({ error: 'El mínimo de inventario no es válido' });
+  if (!['activo', 'inactivo'].includes(nextStatus)) return res.status(400).json({ error: 'El estado del producto no es válido' });
   await pool.query(
     `UPDATE products SET name = $1, category_id = $2, price = $3, description = $4, status = $5, low_stock_threshold = $6, updated_at = now()
      WHERE id = $7`,
     [
-      name ?? product.name,
-      categoryId ?? product.category_id,
-      price !== undefined ? price : product.price,
+      nextName.trim(),
+      nextCategoryId,
+      nextPrice,
       description !== undefined ? description : product.description,
-      status ?? product.status,
-      lowStockThreshold !== undefined ? lowStockThreshold : product.low_stock_threshold,
+      nextStatus,
+      nextThreshold,
       req.params.id,
     ]
   );
@@ -948,17 +1107,39 @@ app.delete('/api/products/:id', requireAuth, requireAdmin, h(async (req, res) =>
 }));
 
 // ---------- INVENTORY ----------
-app.get('/api/inventory/summary', requireAuth, h(async (req, res) => {
+async function getInventorySummary() {
+  const { modern } = await getSeparatedSchemaInfo();
+  const orderIdColumn = modern ? 'separated_order_id' : 'order_id';
+  const withdrawnColumn = modern ? 'quantity_withdrawn' : 'retired_quantity';
   const { rows } = await pool.query(
-    'SELECT COALESCE(SUM(quantity), 0)::int AS total_units FROM inventory'
+    `SELECT COALESCE(SUM(i.quantity), 0)::int AS total_units,
+            COALESCE(SUM(GREATEST(i.quantity - COALESCE(r.reserved, 0), 0)), 0)::int AS available_units,
+            (SELECT COUNT(*)::int FROM products) AS product_count
+    FROM product_variants pv
+    LEFT JOIN inventory i ON i.variant_id = pv.id
+     LEFT JOIN (
+      SELECT soi.variant_id, SUM(GREATEST(soi.quantity - soi.${withdrawnColumn}, 0)) AS reserved
+       FROM separated_order_items soi
+       JOIN separated_orders so ON so.id = soi.${orderIdColumn}
+       WHERE so.status = 'activo'
+       GROUP BY soi.variant_id
+    ) r ON r.variant_id = pv.id`
   );
-  res.json({ totalUnits: rows[0].total_units });
+  return {
+    totalUnits: Number(rows[0].total_units),
+    availableUnits: Number(rows[0].available_units),
+    productCount: Number(rows[0].product_count),
+  };
+}
+
+app.get('/api/inventory/summary', requireAuth, h(async (req, res) => {
+  res.json(await getInventorySummary());
 }));
 
 app.post('/api/inventory/entry', requireAuth, h(async (req, res) => {
   const { variantId, productId, newSize, quantity, reason } = req.body || {};
   const qty = Number(quantity);
-  if ((!variantId && !productId) || !qty || qty <= 0) return res.status(400).json({ error: 'Variante y cantidad válida son obligatorias' });
+  if ((!variantId && !productId) || !Number.isInteger(qty) || qty <= 0 || qty > MAX_STOCK_QUANTITY) return res.status(400).json({ error: 'Variante y cantidad entera válida son obligatorias' });
   const { withTransaction } = require('./db');
   try {
     const result = await withTransaction(async (client) => {
@@ -988,7 +1169,8 @@ app.post('/api/inventory/entry', requireAuth, h(async (req, res) => {
 
 app.post('/api/inventory/adjust', requireAuth, h(async (req, res) => {
   const { variantId, newQuantity, reason } = req.body || {};
-  if (!variantId || newQuantity === undefined || newQuantity < 0)
+  const targetQuantity = Number(newQuantity);
+  if (!variantId || newQuantity === undefined || !Number.isInteger(targetQuantity) || targetQuantity < 0 || targetQuantity > MAX_STOCK_QUANTITY)
     return res.status(400).json({ error: 'Variante y nueva cantidad válida son obligatorias' });
   const { withTransaction } = require('./db');
   try {
@@ -996,10 +1178,10 @@ app.post('/api/inventory/adjust', requireAuth, h(async (req, res) => {
       const invRes = await client.query('SELECT quantity FROM inventory WHERE variant_id = $1 FOR UPDATE', [variantId]);
       if (!invRes.rows[0]) throw Object.assign(new Error('Variante no encontrada'), { statusCode: 404 });
       const reserved = Number((await getReservedQuantityForVariant(client, variantId)) || 0);
-      if (Number(newQuantity) < reserved) {
+      if (targetQuantity < reserved) {
         throw Object.assign(new Error(`El ajuste no puede ser menor que las ${reserved} unidades reservadas en separados activos`), { statusCode: 400 });
       }
-      const diff = Number(newQuantity) - Number(invRes.rows[0].quantity);
+      const diff = targetQuantity - Number(invRes.rows[0].quantity);
       return recordMovement(client, { variantId, type: 'ajuste', quantityChange: diff, reason: reason || 'Ajuste de inventario', userId: req.session.userId });
     });
     res.json({ ok: true, newQuantity: newQty });
@@ -1009,34 +1191,60 @@ app.post('/api/inventory/adjust', requireAuth, h(async (req, res) => {
 }));
 
 app.get('/api/inventory/movements', requireAuth, h(async (req, res) => {
-  const { variantId, limit } = req.query;
+  const { variantId, productId, limit } = req.query;
+  const requestedLimit = Number(limit);
+  const safeLimit = Number.isInteger(requestedLimit) && requestedLimit > 0 ? Math.min(requestedLimit, 500) : 100;
   let rows;
-  if (variantId) {
+  if (productId) {
+    const result = await pool.query(
+      `SELECT im.* FROM inventory_movements im
+       JOIN product_variants pv ON pv.id = im.variant_id
+       WHERE pv.product_id = $1
+       ORDER BY im.created_at DESC, im.id DESC LIMIT $2`,
+      [productId, safeLimit]
+    );
+    rows = result.rows;
+  } else if (variantId) {
     const result = await pool.query(
       'SELECT * FROM inventory_movements WHERE variant_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2',
-      [variantId, Number(limit) || 100]
+      [variantId, safeLimit]
     );
     rows = result.rows;
   } else {
-    const result = await pool.query('SELECT * FROM inventory_movements ORDER BY created_at DESC, id DESC LIMIT $1', [Number(limit) || 100]);
+    const result = await pool.query('SELECT * FROM inventory_movements ORDER BY created_at DESC, id DESC LIMIT $1', [safeLimit]);
     rows = result.rows;
   }
   res.json(rows);
 }));
 
-app.get('/api/inventory/low-stock', requireAuth, h(async (req, res) => {
+async function getLowStockProducts() {
+  const { modern } = await getSeparatedSchemaInfo();
+  const orderIdColumn = modern ? 'separated_order_id' : 'order_id';
+  const withdrawnColumn = modern ? 'quantity_withdrawn' : 'retired_quantity';
   const { rows } = await pool.query(
     `SELECT p.id, p.reference, p.name, p.low_stock_threshold,
-            COALESCE(SUM(i.quantity),0)::int as total_stock
+            COALESCE(SUM(i.quantity),0)::int AS total_stock,
+            COALESCE(SUM(GREATEST(i.quantity - COALESCE(r.reserved, 0), 0)), 0)::int AS total_available
      FROM products p
      JOIN product_variants pv ON pv.product_id = p.id
      LEFT JOIN inventory i ON i.variant_id = pv.id
+     LEFT JOIN (
+       SELECT soi.variant_id, SUM(GREATEST(soi.quantity - soi.${withdrawnColumn}, 0)) AS reserved
+       FROM separated_order_items soi
+       JOIN separated_orders so ON so.id = soi.${orderIdColumn}
+       WHERE so.status = 'activo'
+       GROUP BY soi.variant_id
+     ) r ON r.variant_id = pv.id
      WHERE p.status = 'activo'
      GROUP BY p.id
-     HAVING COALESCE(SUM(i.quantity),0) <= p.low_stock_threshold
-     ORDER BY total_stock ASC`
+     HAVING COALESCE(SUM(GREATEST(i.quantity - COALESCE(r.reserved, 0), 0)), 0) <= p.low_stock_threshold
+     ORDER BY total_available ASC`
   );
-  res.json(rows);
+  return rows;
+}
+
+app.get('/api/inventory/low-stock', requireAuth, h(async (req, res) => {
+  res.json(await getLowStockProducts());
 }));
 
 // ---------- SALES ----------
@@ -1060,7 +1268,7 @@ app.post('/api/sales', requireAuth, h(async (req, res) => {
       for (const it of items) {
         const variant = await getVariantContext(client, Number(it.variantId));
         const qty = Number(it.quantity);
-        if (!qty || qty <= 0) throw Object.assign(new Error('Cantidad inválida en el carrito'), { statusCode: 400 });
+        if (!Number.isInteger(qty) || qty <= 0 || qty > MAX_STOCK_QUANTITY) throw Object.assign(new Error('Cantidad inválida en el carrito'), { statusCode: 400 });
         await ensureAvailableForVariant(client, variant.id, qty, `${variant.reference}${variant.size ? ' talla ' + variant.size : ''}`);
         preparedItems.push({
           variantId: variant.id,
@@ -1086,7 +1294,7 @@ app.post('/api/sales', requireAuth, h(async (req, res) => {
 app.get('/api/sales', requireAuth, h(async (req, res) => {
   const { rows } = await pool.query(
     `SELECT s.*, u.full_name as user_name FROM sales s JOIN users u ON u.id = s.user_id
-     ORDER BY s.created_at DESC, s.id DESC LIMIT 200`
+     ORDER BY s.created_at DESC, s.id DESC`
   );
   res.json(rows.map((r) => ({ ...r, total: Number(r.total) })));
 }));
@@ -1120,27 +1328,20 @@ app.post('/api/sales/:id/void', requireAuth, h(async (req, res) => {
 
 // ---------- DASHBOARD ----------
 app.get('/api/dashboard', requireAuth, h(async (req, res) => {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = reports.businessDate();
   const t = await reports.totals(today, today);
-  const [lowStock, inventoryTotal, expiredSeparated] = await Promise.all([
-    pool.query(
-    `SELECT COUNT(*)::int as c FROM (
-       SELECT p.id, COALESCE(SUM(i.quantity),0) as total_stock
-       FROM products p JOIN product_variants pv ON pv.product_id = p.id
-       LEFT JOIN inventory i ON i.variant_id = pv.id
-       WHERE p.status = 'activo'
-       GROUP BY p.id HAVING COALESCE(SUM(i.quantity),0) <= p.low_stock_threshold
-     ) x`
-    ),
-    pool.query('SELECT COALESCE(SUM(quantity), 0)::int AS total_units FROM inventory'),
+  const [lowStock, inventorySummary, expiredSeparated] = await Promise.all([
+    getLowStockProducts(),
+    getInventorySummary(),
     pool.query("SELECT COUNT(*)::int AS c FROM separated_orders WHERE status = 'activo' AND due_at < now()"),
   ]);
   res.json({
     salesToday: t.revenue,
     salesCountToday: t.saleCount,
     itemsSoldToday: t.itemsSold,
-    lowStockCount: lowStock.rows[0].c,
-    inventoryUnits: inventoryTotal.rows[0].total_units,
+    lowStockCount: lowStock.length,
+    inventoryUnits: inventorySummary.totalUnits,
+    availableInventoryUnits: inventorySummary.availableUnits,
     expiredSeparatedCount: expiredSeparated.rows[0].c,
   });
 }));
@@ -1182,8 +1383,10 @@ app.use(express.static(path.join(__dirname, '..', 'public')));
 const PORT = process.env.PORT || 3000;
 if (require.main === module) {
   initSchema()
-    .then(() => {
+    .then(async () => {
       app.listen(PORT, () => console.log(`Marce Brillo y Estilo escuchando en puerto ${PORT}`));
+      if (changeNotificationsSupported) startChangeListener();
+      else console.warn('DATABASE_URL usa Neon pooler: las pantallas se sincronizan mediante consultas periódicas.');
     })
     .catch((err) => {
       console.error('No se pudo inicializar la base de datos:', err.message);

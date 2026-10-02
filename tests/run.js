@@ -1,5 +1,9 @@
 // End-to-end tests against a running server (see tests/README or npm test wrapper).
 const BASE = process.env.TEST_BASE_URL || 'http://localhost:3000';
+require('dotenv').config();
+const { businessDate, resolveRange } = require('../src/reports');
+const { toCents, fromCents } = require('../src/money');
+const { pool } = require('../src/db');
 
 let cookie = '';
 let passed = 0;
@@ -26,7 +30,38 @@ async function req(method, path, body) {
   return { status: res.status, data };
 }
 
+async function waitForChangeEvent(reader, timeoutMs = 3000) {
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let timeout;
+  const readUntilChange = (async () => {
+    while (!buffer.includes('event: change')) {
+      const { done, value } = await reader.read();
+      if (done) return false;
+      buffer += decoder.decode(value, { stream: true });
+    }
+    return true;
+  })();
+  try {
+    return await Promise.race([
+      readUntilChange,
+      new Promise((resolve) => { timeout = setTimeout(() => resolve(false), timeoutMs); }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function run() {
+  console.log('--- LOCAL DATE AND MONEY ---');
+  assert(businessDate(new Date('2026-10-02T02:00:00Z')) === '2026-10-01', 'La fecha de negocio respeta la zona horaria de Colombia');
+  const dateRange = resolveRange('2026-10-01', '2026-10-02');
+  assert(dateRange.fromDate.toISOString() === '2026-10-01T05:00:00.000Z' && dateRange.toDate.toISOString() === '2026-10-03T04:59:59.999Z', 'Los rangos incluyen el día completo de Colombia');
+  let invalidRangeRejected = false;
+  try { resolveRange('2026-10-03', '2026-10-02'); } catch (error) { invalidRangeRejected = error.statusCode === 400; }
+  assert(invalidRangeRejected, 'Los informes rechazan rangos de fechas invertidos');
+  assert(fromCents(toCents(100000.25)) === 100000.25, 'La conversión monetaria conserva centavos');
+
   console.log('--- LOGIN ---');
   let r = await req('POST', '/api/login', { username: 'nope', password: 'wrong' });
   assert(r.status === 401, 'Login con credenciales incorrectas es rechazado');
@@ -41,15 +76,32 @@ async function run() {
   r = await req('GET', '/api/categories');
   assert(r.status === 200 && r.data.length >= 5, 'Categorías por defecto existen');
 
+  const liveController = new AbortController();
+  const liveResponse = await fetch(BASE + '/api/events', {
+    headers: { ...(cookie ? { Cookie: cookie } : {}) },
+    signal: liveController.signal,
+  });
+  assert(liveResponse.status === 200 && liveResponse.headers.get('content-type')?.includes('text/event-stream'), 'Canal de actualizaciones en tiempo real requiere sesión y conecta');
+  const liveReader = liveResponse.ok ? liveResponse.body.getReader() : null;
+  if (liveReader) await liveReader.read();
+
   r = await req('GET', '/api/inventory/summary');
-  assert(r.status === 200 && Number.isInteger(r.data.totalUnits), 'Resumen devuelve el total de unidades del inventario');
+  assert(r.status === 200 && Number.isInteger(r.data.totalUnits) && Number.isInteger(r.data.availableUnits) && Number.isInteger(r.data.productCount), 'Resumen devuelve unidades físicas, disponibles y cantidad de productos');
 
   r = await req('GET', '/api/dashboard');
-  assert(r.status === 200 && Number.isInteger(r.data.inventoryUnits), 'Dashboard devuelve el total de unidades en stock');
+  assert(r.status === 200 && Number.isInteger(r.data.inventoryUnits) && Number.isInteger(r.data.availableInventoryUnits), 'Dashboard devuelve unidades físicas y disponibles');
 
   r = await req('POST', '/api/categories', { name: 'Cinturones-Test' });
   assert(r.status === 200, 'Crear categoría nueva funciona');
+  if (liveReader) assert(await waitForChangeEvent(liveReader), 'Los cambios confirmados llegan por el canal en tiempo real');
+  liveController.abort();
   const catId = r.data.id;
+
+  r = await req('POST', '/api/products', {
+    reference: 'TALLAS-EMPTY-TEST', name: 'Producto sin tallas', categoryId: catId, price: 1000,
+    hasVariants: true, sizes: [],
+  });
+  assert(r.status === 400, 'No permite crear productos con tallas sin variantes');
 
   r = await req('POST', '/api/categories', { name: 'Cinturones-Test' });
   assert(r.status === 409, 'No permite categorías duplicadas');
@@ -61,7 +113,12 @@ async function run() {
   });
   assert(r.status === 200, 'Crear producto con tallas funciona');
   const productWithSizes = r.data;
+  const variant35 = productWithSizes.variants.find((v) => v.size === '35');
+  const variant36 = productWithSizes.variants.find((v) => v.size === '36');
   assert(productWithSizes.total_stock === 5, 'Stock inicial con tallas es correcto (2+3=5)');
+  assert(productWithSizes.total_available === 5 && productWithSizes.variants.every((variant) => Number.isInteger(variant.available_quantity)), 'Inventario expone disponibilidad de todas las variantes');
+  r = await req('GET', '/api/inventory/movements?productId=' + productWithSizes.id);
+  assert(r.status === 200 && r.data.some((movement) => movement.variant_id === variant35.variant_id) && r.data.some((movement) => movement.variant_id === variant36.variant_id), 'Movimientos de producto incluyen todas sus variantes');
 
   r = await req('POST', '/api/products', {
     reference: 'AJ-TEST-45', name: 'Duplicado', categoryId: catId, price: 1000, hasVariants: false, initialStock: 1,
@@ -77,17 +134,26 @@ async function run() {
   assert(productNoSizes.total_stock === 5, 'Stock inicial sin tallas es correcto');
   assert(productNoSizes.variants.length === 1 && productNoSizes.variants[0].size === null, 'Producto sin tallas tiene una única variante sin talla');
 
+  r = await req('POST', '/api/products', {
+    reference: 'MISSING-STOCK-TEST', name: 'Variante sin fila de stock', categoryId: catId, price: 1000,
+    hasVariants: false, initialStock: 0,
+  });
+  const missingStockVariantId = r.data.variants[0].variant_id;
+  await pool.query('DELETE FROM inventory WHERE variant_id = $1', [missingStockVariantId]);
+  r = await req('POST', '/api/inventory/entry', { variantId: missingStockVariantId, quantity: 1, reason: 'Reconstrucción de fila' });
+  assert(r.status === 200 && r.data.newQuantity === 1, 'Una entrada repara y actualiza variantes sin fila de inventario');
+
   console.log('--- INVENTORY ENTRY ---');
-  const variant35 = productWithSizes.variants.find((v) => v.size === '35');
   r = await req('POST', '/api/inventory/entry', { variantId: variant35.variant_id, quantity: 4, reason: 'Reposición' });
   assert(r.status === 200 && r.data.newQuantity === 6, 'Entrada de inventario suma correctamente (2+4=6)');
 
   console.log('--- ADJUSTMENTS ---');
   r = await req('POST', '/api/inventory/adjust', { variantId: variant35.variant_id, newQuantity: 4, reason: 'Conteo físico' });
   assert(r.status === 200 && r.data.newQuantity === 4, 'Ajuste de inventario corrige a la cantidad indicada');
+  r = await req('POST', '/api/inventory/adjust', { variantId: variant35.variant_id, newQuantity: 1.5, reason: 'Cantidad inválida' });
+  assert(r.status === 400, 'El inventario rechaza cantidades fraccionarias');
 
   console.log('--- SALES: single item ---');
-  const variant36 = productWithSizes.variants.find((v) => v.size === '36');
   r = await req('POST', '/api/sales', { items: [{ variantId: variant36.variant_id, quantity: 1 }] });
   assert(r.status === 200, 'Venta simple se registra correctamente');
   const saleId1 = r.data.saleId;
@@ -147,6 +213,12 @@ async function run() {
   await req('PUT', '/api/products/' + priceProduct.id, { price: 170000 });
   r = await req('GET', '/api/sales/' + saleAtOldPrice);
   assert(r.data.items[0].unit_price === 100000, 'La venta conserva el precio histórico aunque el precio actual cambie');
+
+  r = await req('POST', '/api/products', {
+    reference: 'PRC-CENTS-TEST', name: 'Producto con centavos', categoryId: catId, price: 100000.25, hasVariants: false, initialStock: 1,
+  });
+  r = await req('POST', '/api/sales', { items: [{ variantId: r.data.variants[0].variant_id, quantity: 1 }] });
+  assert(r.status === 200 && r.data.total === 100000.25, 'La venta conserva correctamente los centavos en su total');
 
   console.log('--- SEARCH ---');
   r = await req('GET', '/api/products?q=AJ');
@@ -213,10 +285,9 @@ async function run() {
   assert(r.status === 400, 'La venta normal respeta las reservas activas del separado');
 
   r = await req('POST', `/api/separados/${separatedId}/retiro`, { quantity: 1 });
-  assert(r.status === 200 || r.status === 400, 'Retiro parcial del separado se procesa con validación');
-  if (r.status === 200) {
-    assert(true, 'Retiro parcial del separado disminuye stock físico');
-  }
+  assert(r.status === 200, 'Retiro parcial del separado se procesa correctamente');
+  r = await req('GET', '/api/separados/' + separatedId);
+  assert(r.status === 200 && r.data.items.reduce((sum, item) => sum + Number(item.retired_quantity || 0), 0) === 1, 'El retiro parcial queda reflejado en sus artículos');
 
   r = await req('POST', `/api/separados/${separatedId}/anular`, { reason: 'Prueba de liberación' });
   assert(r.status === 200, 'Anular separado libera sus reservas activas');
@@ -227,6 +298,14 @@ async function run() {
     items: [{ variantId: separatedProduct.variants[0].variant_id, quantity: 99, unitPrice: 90000 }],
   });
   assert(r.status === 400, 'No permite reservar más de la disponibilidad real');
+
+  r = await req('POST', '/api/separados', {
+    clientName: 'Cliente individual',
+    phone: '3200002222',
+    items: [{ variantId: separatedProduct.variants[0].variant_id, quantity: 1, unitPrice: 90000 }],
+  });
+  assert(r.status === 200 && r.data.orderId, 'Crear separado con un solo producto funciona');
+  if (r.status === 200) await req('POST', `/api/separados/${r.data.orderId}/anular`, { reason: 'Prueba de artículo único' });
 
   console.log('--- FIADOS ---');
   r = await req('GET', '/api/products/' + productWithSizes.id);

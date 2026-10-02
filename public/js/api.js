@@ -37,7 +37,12 @@ const api = {
 };
 
 function fmtMoney(n) {
-  return '$' + Math.round(n).toLocaleString('es-CO');
+  const value = Number(n) || 0;
+  const hasCents = Math.round(value * 100) % 100 !== 0;
+  return '$' + value.toLocaleString('es-CO', {
+    minimumFractionDigits: hasCents ? 2 : 0,
+    maximumFractionDigits: 2,
+  });
 }
 
 function toast(message, type = '') {

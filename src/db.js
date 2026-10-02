@@ -9,6 +9,8 @@ if (!process.env.DATABASE_URL) {
 // Neon requiere SSL. Para una base de datos Postgres local en desarrollo (sin SSL),
 // define PGSSL=disable en tu .env.
 const useSSL = process.env.PGSSL !== 'disable';
+const changeNotificationsSupported = Boolean(process.env.DATABASE_URL_DIRECT)
+  || !/-pooler(?:\.|$)/i.test(new URL(process.env.DATABASE_URL).hostname);
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -16,9 +18,22 @@ const pool = new Pool({
   max: 10,
 });
 
+const changeListenerPool = process.env.DATABASE_URL_DIRECT
+  ? new Pool({
+    connectionString: process.env.DATABASE_URL_DIRECT,
+    ssl: useSSL ? { rejectUnauthorized: false } : false,
+    max: 1,
+  })
+  : pool;
+
 pool.on('error', (err) => {
   console.error('Error inesperado en el pool de conexiones a la base de datos:', err.message);
 });
+if (changeListenerPool !== pool) {
+  changeListenerPool.on('error', (err) => {
+    console.error('Error en la conexión directa para cambios en tiempo real:', err.message);
+  });
+}
 
 async function query(text, params) {
   return pool.query(text, params);
@@ -207,6 +222,32 @@ CREATE TABLE IF NOT EXISTS credit_payments (
   note TEXT
 );
 
+CREATE OR REPLACE FUNCTION notify_marce_brillo_change() RETURNS trigger AS $$
+BEGIN
+  PERFORM pg_notify('marce_brillo_changes', TG_TABLE_NAME);
+  RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$
+DECLARE
+  table_name TEXT;
+BEGIN
+  FOREACH table_name IN ARRAY ARRAY[
+    'categories', 'users', 'products', 'product_variants', 'inventory',
+    'sales', 'sale_items', 'inventory_movements', 'separated_orders',
+    'separated_order_items', 'separated_payments', 'credit_sales',
+    'credit_sale_items', 'credit_payments'
+  ]
+  LOOP
+    EXECUTE format('DROP TRIGGER IF EXISTS marce_brillo_change ON %I', table_name);
+    EXECUTE format(
+      'CREATE TRIGGER marce_brillo_change AFTER INSERT OR UPDATE OR DELETE ON %I FOR EACH STATEMENT EXECUTE FUNCTION notify_marce_brillo_change()',
+      table_name
+    );
+  END LOOP;
+END $$;
+
 CREATE INDEX IF NOT EXISTS idx_products_reference ON products(reference);
 CREATE INDEX IF NOT EXISTS idx_products_category ON products(category_id);
 CREATE INDEX IF NOT EXISTS idx_variants_product ON product_variants(product_id);
@@ -261,7 +302,10 @@ END $$;
 `;
 
 async function initSchema() {
-  await pool.query(SCHEMA_SQL);
+  await withTransaction(async (client) => {
+    await client.query('SELECT pg_advisory_xact_lock($1)', [1874500]);
+    await client.query(SCHEMA_SQL);
+  });
 }
 
-module.exports = { pool, query, withTransaction, initSchema };
+module.exports = { pool, changeListenerPool, changeNotificationsSupported, query, withTransaction, initSchema };

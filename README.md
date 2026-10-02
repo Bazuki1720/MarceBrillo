@@ -13,6 +13,8 @@ Aplicación web para gestionar productos, inventario (con y sin tallas), ventas,
 
 En resumen: la "cara" del programa (lo que ves) sigue siendo simple y local; lo único que cambió es que los datos ahora están respaldados en la nube en vez de en un archivo dentro de tu PC.
 
+Los cambios confirmados en productos, inventario, ventas, separados y fiados se notifican entre las instancias conectadas a la misma base de datos mediante PostgreSQL `LISTEN/NOTIFY`. Para Neon, configura `DATABASE_URL_DIRECT` con la conexión directa (sin `-pooler`) para recibir cambios inmediatamente; sin ella, las pantallas consultan de nuevo cada 5 segundos.
+
 ## Paso 1: crear la base de datos en Neon (una sola vez)
 
 1. Ve a **https://neon.tech** y crea una cuenta gratuita (puedes usar tu correo o tu cuenta de Google/GitHub).
@@ -91,6 +93,7 @@ Desde el dashboard, botón **📊 Informes**, encuentras:
 Ver `.env.example`. Las más importantes:
 
 - `DATABASE_URL`: cadena de conexión de tu base de datos Neon (obligatoria).
+- `DATABASE_URL_DIRECT`: conexión directa opcional a la misma base para eventos inmediatos `LISTEN/NOTIFY`; usa el host sin `-pooler`.
 - `SESSION_SECRET`: clave para firmar las sesiones. Usa un valor largo y aleatorio en producción.
 - `ADMIN_USERNAME` / `ADMIN_PASSWORD`: solo se usan una vez, cuando la tabla de usuarios está vacía.
 - `PGSSL=disable`: solo para pruebas locales contra un Postgres sin SSL en tu propia máquina; **no la uses con Neon**, que siempre requiere SSL.
@@ -101,6 +104,7 @@ Tablas principales: `users`, `categories`, `products`, `product_variants`, `inve
 
 - Cada producto tiene una o más **variantes** (`product_variants`). Si el producto no maneja tallas, tiene una única variante con talla `NULL` que representa todo su stock.
 - El **inventario** vive por variante (`inventory.quantity`), nunca es negativo (se valida dentro de la misma transacción de Postgres).
+- El inventario muestra por separado unidades físicas y disponibles; las unidades reservadas en separados activos no se ofrecen para otra venta.
 - Cada movimiento de inventario (entrada, venta, devolución, ajuste) queda registrado en `inventory_movements` con usuario, fecha y motivo — esto es lo que alimenta los informes.
 - Las ventas nunca se borran: se **anulan** (cambia el estado y se devuelve el inventario automáticamente).
 - Los precios de venta quedan **congelados** en `sale_items.unit_price` al momento de la venta, aunque el precio del producto cambie después.
@@ -109,7 +113,7 @@ No hay migraciones separadas: el esquema se crea automáticamente (`CREATE TABLE
 
 ## Pruebas
 
-`tests/run.js` es una batería de 42 pruebas automáticas que ejercitan la API real (no simulada): login/logout, categorías, productos con y sin tallas, entradas de inventario, ajustes, ventas simples y múltiples, stock insuficiente, stock en cero, historial, anulación y devolución de inventario, precio histórico, búsqueda parcial, informes/reportes, usuarios y permisos.
+`tests/run.js` contiene pruebas end-to-end que ejercitan la API real: autenticación, productos, inventario por variantes, sincronización SSE, ventas, separados, fiados, anulaciones, informes, usuarios y permisos.
 
 ```bash
 node src/server.js &         # levanta el servidor (usa la base de datos de tu .env)
@@ -144,6 +148,7 @@ src/
   db.js               conexión a Postgres/Neon y esquema de la base de datos
   auth.js             middlewares de autenticación/autorización
   inventoryLogic.js    lógica transaccional de inventario y ventas
+   money.js             conversiones monetarias exactas a centavos
   reports.js            consultas de informes y reportes
   server.js             servidor Express y todas las rutas de la API
   seed.js                crea tablas, categorías por defecto y el usuario administrador
@@ -154,7 +159,7 @@ public/
   js/api.js               utilidades para llamar a la API
   js/app.js                toda la lógica de pantallas (dashboard, inventario, ventas, informes, etc.)
 tests/
-  run.js                 pruebas automáticas end-to-end (42 pruebas)
+   run.js                 pruebas automáticas end-to-end
 Dockerfile                imagen lista si en el futuro quieres desplegar también el servidor en la nube
 .env.example              variables de entorno de ejemplo
 ```

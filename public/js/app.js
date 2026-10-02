@@ -2,6 +2,8 @@ let CURRENT_USER = null;
 let CATEGORIES = [];
 const view = document.getElementById('view');
 let navigationToken = 0;
+let liveRefreshTimer = null;
+let liveRefreshPending = false;
 
 async function init() {
   try {
@@ -19,7 +21,73 @@ async function init() {
   } catch (e) { CATEGORIES = []; }
 
   window.addEventListener('hashchange', router);
+  startLiveUpdates();
   router();
+}
+
+function startLiveUpdates() {
+  const events = new EventSource('/api/events');
+  events.addEventListener('change', scheduleLiveRefresh);
+  window.addEventListener('focusout', () => {
+    if (liveRefreshPending) scheduleLiveRefresh();
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) scheduleLiveRefresh();
+  });
+  window.setInterval(scheduleLiveRefresh, 5000);
+}
+
+function scheduleLiveRefresh() {
+  if (document.hidden || document.getElementById('modalOverlay')) {
+    liveRefreshPending = true;
+    return;
+  }
+  const active = document.activeElement;
+  const liveSearchInput = active?.id === 'invSearch' || active?.id === 'saleSearch';
+  if (active && view.contains(active) && active.matches('input, textarea, select') && !liveSearchInput) {
+    liveRefreshPending = true;
+    return;
+  }
+  liveRefreshPending = false;
+  clearTimeout(liveRefreshTimer);
+  liveRefreshTimer = setTimeout(refreshCurrentView, 250);
+}
+
+async function refreshCurrentView() {
+  const { route, params } = parseHash();
+  try {
+    if (route === 'dashboard' || !route) return await renderDashboard();
+    if (route === 'inventario') {
+      const query = document.getElementById('invSearch')?.value || '';
+      await Promise.all([loadInventoryTotal(), loadInventoryResults(query)]);
+      return;
+    }
+    if (route === 'producto' && params[0]) return await renderProductDetail(params[0]);
+    if (route === 'producto-nuevo') {
+      const categorySelect = document.getElementById('pCategory');
+      const selectedCategory = categorySelect?.value;
+      CATEGORIES = await api.get('/api/categories');
+      if (categorySelect) {
+        categorySelect.innerHTML = CATEGORIES.map((category) => `<option value="${category.id}">${escapeHtml(category.name)}</option>`).join('');
+        if (CATEGORIES.some((category) => String(category.id) === selectedCategory)) categorySelect.value = selectedCategory;
+      }
+      return;
+    }
+    if (route === 'venta') {
+      const query = document.getElementById('saleSearch')?.value || '';
+      return await loadSaleSearchResults(query);
+    }
+    if (route === 'historial') return await renderHistory();
+    if (route === 'venta-detalle' && params[0]) return await renderSaleDetail(params[0]);
+    if (route === 'separados') return await renderSeparatedOrders(document.getElementById('separatedSearch')?.value || '');
+    if (route === 'separado-detalle' && params[0]) return await renderSeparatedDetail(params[0]);
+    if (route === 'fiados') return await renderCreditSales(document.getElementById('fiadoSearch')?.value || '');
+    if (route === 'fiado-detalle' && params[0]) return await renderCreditDetail(params[0]);
+    if (route === 'informes') return await renderReports();
+    if (route === 'configuracion') return await renderSettings();
+  } catch (error) {
+    toast('No se pudieron actualizar los datos. Se volverá a intentar.', 'error');
+  }
 }
 
 function navigate(hash) { window.location.hash = hash; }
@@ -93,7 +161,11 @@ async function renderDashboard() {
         <div class="value">${data.expiredSeparatedCount || 0}</div>
       </div>
       <div class="card stat-card">
-        <div class="label">Productos en stock</div>
+        <div class="label">Unidades disponibles</div>
+        <div class="value">${data.availableInventoryUnits}</div>
+      </div>
+      <div class="card stat-card">
+        <div class="label">Unidades físicas</div>
         <div class="value">${data.inventoryUnits}</div>
       </div>
     </div>
@@ -565,7 +637,7 @@ async function loadInventoryTotal() {
     const summary = await api.get('/api/inventory/summary');
     if (!document.getElementById('inventoryTotal')) return;
     container.className = 'card inventory-total';
-    container.innerHTML = `<span class="label">Productos en inventario</span><strong>${summary.totalUnits}</strong><span class="helper-text">Unidades disponibles en total</span>`;
+    container.innerHTML = `<span class="label">Inventario total</span><strong>${summary.availableUnits}</strong><span class="helper-text">Unidades disponibles · ${summary.totalUnits} físicas · ${summary.productCount} productos</span>`;
   } catch (err) {
     container.className = 'card inventory-total error-text';
     container.textContent = 'No se pudo cargar el total del inventario.';
@@ -589,9 +661,9 @@ loadInventoryResults.lastRequestId = 0;
 function productCardHtml(p) {
   const chips = p.variants
     .map((v) => {
-      const low = v.quantity <= (p.low_stock_threshold || 3);
+      const low = v.available_quantity <= (p.low_stock_threshold ?? 3);
       const label = v.size ? v.size : 'Stock';
-      return `<span class="size-chip ${low ? 'low' : ''}">${escapeHtml(label)}: ${v.quantity}</span>`;
+      return `<span class="size-chip ${low ? 'low' : ''}">${escapeHtml(label)}: ${v.available_quantity} disp. (${v.quantity} físicas)</span>`;
     })
     .join('');
   return `
@@ -600,7 +672,7 @@ function productCardHtml(p) {
       <div class="name">${escapeHtml(p.name)} ${p.status === 'inactivo' ? '<span class="badge badge-danger">Inactivo</span>' : ''}</div>
       <div class="meta">${escapeHtml(p.category_name || '')} · ${fmtMoney(p.price)}</div>
       <div class="size-chip-row">${chips}</div>
-      <div class="total-stock">Total: ${p.total_stock} disponibles</div>
+      <div class="total-stock">${p.total_available} disponibles · ${p.total_stock} físicas</div>
     </div>
   `;
 }
@@ -608,7 +680,7 @@ function productCardHtml(p) {
 // ---------------- PRODUCT DETAIL ----------------
 async function renderProductDetail(id) {
   const p = await api.get('/api/products/' + id);
-  const movements = await api.get('/api/inventory/movements?variantId=' + (p.variants[0] ? p.variants[0].variant_id : ''));
+  const movements = await api.get('/api/inventory/movements?productId=' + encodeURIComponent(id) + '&limit=100');
   view.innerHTML = `
     ${backLink('inventario', 'Inventario')}
     <h2 class="section-title">${escapeHtml(p.name)}</h2>
@@ -617,9 +689,9 @@ async function renderProductDetail(id) {
       <p class="meta">${escapeHtml(p.category_name)} · ${fmtMoney(p.price)} ${p.status === 'inactivo' ? '<span class="badge badge-danger">Inactivo</span>' : '<span class="badge badge-ok">Activo</span>'}</p>
       ${p.description ? `<p>${escapeHtml(p.description)}</p>` : ''}
       <div class="size-chip-row" style="margin-top:10px">
-        ${p.variants.map((v) => `<span class="size-chip ${v.quantity <= p.low_stock_threshold ? 'low' : ''}">${escapeHtml(v.size || 'Stock')}: ${v.quantity}</span>`).join('')}
+        ${p.variants.map((v) => `<span class="size-chip ${v.available_quantity <= p.low_stock_threshold ? 'low' : ''}">${escapeHtml(v.size || 'Stock')}: ${v.available_quantity} disp. (${v.quantity} físicas)</span>`).join('')}
       </div>
-      <p class="total-stock">Total: ${p.total_stock} disponibles</p>
+      <p class="total-stock">${p.total_available} disponibles · ${p.total_stock} físicas</p>
     </div>
 
     <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:20px">
@@ -1017,8 +1089,11 @@ function togglePaymentDestination() {
 
 async function loadSaleSearchResults(q) {
   const container = document.getElementById('saleResults');
+  if (!container) return;
+  const requestId = ++loadSaleSearchResults.lastRequestId;
   if (!q || !q.trim()) { container.innerHTML = ''; return; }
   const products = await api.get('/api/products?q=' + encodeURIComponent(q));
+  if (requestId !== loadSaleSearchResults.lastRequestId || !document.getElementById('saleResults')) return;
   const active = products.filter((p) => p.status === 'activo');
   if (active.length === 0) {
     container.innerHTML = `<p class="helper-text">No se encontraron productos.</p>`;
@@ -1040,6 +1115,7 @@ async function loadSaleSearchResults(q) {
     </div>
   `).join('');
 }
+loadSaleSearchResults.lastRequestId = 0;
 
 function addToCart(item) {
   const existing = CART.find((c) => c.variantId === item.variantId);
@@ -1310,11 +1386,20 @@ let reportRange = { from: null, to: null, preset: '30d' };
 
 function computePresetRange(preset) {
   const today = new Date();
-  const toStr = (d) => d.toISOString().slice(0, 10);
-  if (preset === 'today') return { from: toStr(today), to: toStr(today) };
-  if (preset === '7d') { const f = new Date(today); f.setDate(f.getDate() - 6); return { from: toStr(f), to: toStr(today) }; }
-  if (preset === 'month') { const f = new Date(today.getFullYear(), today.getMonth(), 1); return { from: toStr(f), to: toStr(today) }; }
-  const f = new Date(today); f.setDate(f.getDate() - 29); return { from: toStr(f), to: toStr(today) };
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Bogota', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(today);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  const todayKey = `${values.year}-${values.month}-${values.day}`;
+  const shiftedDay = (amount) => {
+    const date = new Date(`${todayKey}T00:00:00Z`);
+    date.setUTCDate(date.getUTCDate() + amount);
+    return date.toISOString().slice(0, 10);
+  };
+  if (preset === 'today') return { from: todayKey, to: todayKey };
+  if (preset === '7d') return { from: shiftedDay(-6), to: todayKey };
+  if (preset === 'month') return { from: `${todayKey.slice(0, 7)}-01`, to: todayKey };
+  return { from: shiftedDay(-29), to: todayKey };
 }
 
 async function renderReports() {
@@ -1425,7 +1510,8 @@ function barChartSvg(timeline) {
     const barHeight = (t.total / max) * (height - padding - 10);
     const x = padding + i * barWidth;
     const y = height - padding - barHeight;
-    const label = new Date(t.period).toLocaleDateString('es-CO', { day: '2-digit', month: '2-digit' });
+    const dateParts = String(t.period).slice(0, 10).split('-');
+    const label = dateParts.length === 3 ? `${dateParts[2]}/${dateParts[1]}` : '';
     return `
       <rect x="${x + 2}" y="${y}" width="${Math.max(barWidth - 4, 2)}" height="${barHeight}" fill="#6d1f3f" rx="3"></rect>
       <text x="${x + barWidth / 2}" y="${height - 6}" font-size="9" text-anchor="middle" fill="#6b5a62">${label}</text>
