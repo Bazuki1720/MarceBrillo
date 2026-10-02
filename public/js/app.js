@@ -207,7 +207,10 @@ async function renderSeparatedOrders(searchTerm = '') {
         </div>
         <div class="name">${escapeHtml(order.client_name)}</div>
         <div class="meta">${escapeHtml(order.phone)} · ${new Date(order.created_at).toLocaleDateString('es-CO')} · vence ${new Date(order.due_at).toLocaleDateString('es-CO')}</div>
-        <div class="total-stock">Total: ${fmtMoney(order.total)} · Pagado: ${fmtMoney(order.paid_amount)} · Saldo: ${fmtMoney(order.balance || 0)}</div>
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-top:8px">
+          <div class="total-stock">Total: ${fmtMoney(order.total)} · Pagado: ${fmtMoney(order.paid_amount)} · Saldo: ${fmtMoney(order.balance || 0)}</div>
+          ${order.status === 'activo' && Number(order.paid_amount) === 0 ? `<button class="btn btn-danger" onclick="event.stopPropagation(); openSeparatedCancel(${order.id});">🚫 Anular</button>` : ''}
+        </div>
       </div>
     `).join('')}
   `;
@@ -283,7 +286,10 @@ async function renderCreditSales(searchTerm = '') {
         </div>
         <div class="name">${escapeHtml(credit.client_name)}</div>
         <div class="meta">${escapeHtml(credit.phone)} · ${new Date(credit.created_at).toLocaleDateString('es-CO')}</div>
-        <div class="total-stock">Total: ${fmtMoney(credit.total)} · Pagado: ${fmtMoney(credit.paid_amount)} · Saldo: ${fmtMoney(credit.balance || 0)}</div>
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-top:8px">
+          <div class="total-stock">Total: ${fmtMoney(credit.total)} · Pagado: ${fmtMoney(credit.paid_amount)} · Saldo: ${fmtMoney(credit.balance || 0)}</div>
+          ${credit.status !== 'anulado' && Number(credit.paid_amount) === 0 ? `<button class="btn btn-danger" onclick="event.stopPropagation(); openFiadoCancel(${credit.id});">🚫 Anular</button>` : ''}
+        </div>
       </div>
     `).join('')}
   `;
