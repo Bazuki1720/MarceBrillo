@@ -10,6 +10,7 @@ const reports = require('./reports');
 const { toCents, fromCents } = require('./money');
 const MAX_STOCK_QUANTITY = 2147483647;
 const MAX_MONEY_CENTS = 999999999999;
+const ACCOUNT_PAYMENT_METHODS = new Set(['efectivo', 'transferencia', 'addi', 'nequi', 'qr', 'daviplata']);
 
 const app = express();
 const CHANGE_CHANNEL = 'marce_brillo_changes';
@@ -329,6 +330,42 @@ async function ensureAvailableForVariant(client, variantId, quantity, contextLab
   }
 }
 
+async function prepareAccountItems(client, items, accountLabel) {
+  let totalCents = 0;
+  const preparedItems = [];
+  const requestedByVariant = new Map();
+  for (const item of orderItemsByVariantId(items)) {
+    const quantity = Number(item.quantity);
+    if (!Number.isInteger(quantity) || quantity <= 0 || quantity > MAX_STOCK_QUANTITY) {
+      throw Object.assign(new Error(`Cantidad inválida en ${accountLabel}`), { statusCode: 400 });
+    }
+    const variant = await getVariantContext(client, Number(item.variantId));
+    const requested = (requestedByVariant.get(variant.id) || 0) + quantity;
+    await ensureAvailableForVariant(client, variant.id, requested, `${variant.reference}${variant.size ? ' talla ' + variant.size : ''}`);
+    requestedByVariant.set(variant.id, requested);
+    const rawUnitPrice = Number(item.unitPrice ?? variant.price);
+    if (!Number.isFinite(rawUnitPrice) || rawUnitPrice < 0) {
+      throw Object.assign(new Error(`Precio inválido para ${accountLabel}`), { statusCode: 400 });
+    }
+    const unitPriceCents = toCents(rawUnitPrice);
+    const subtotalCents = quantity * unitPriceCents;
+    if (!Number.isSafeInteger(subtotalCents) || subtotalCents > MAX_MONEY_CENTS || totalCents > MAX_MONEY_CENTS - subtotalCents) {
+      throw Object.assign(new Error(`El total de ${accountLabel} supera el valor máximo permitido`), { statusCode: 400 });
+    }
+    totalCents += subtotalCents;
+    preparedItems.push({
+      variantId: variant.id,
+      quantity,
+      unitPrice: fromCents(unitPriceCents),
+      subtotal: fromCents(subtotalCents),
+      productReference: variant.reference,
+      productName: variant.product_name,
+      size: variant.size,
+    });
+  }
+  return { preparedItems, totalCents };
+}
+
 async function getSeparatedOrderPayload(client, orderId) {
   const orderRes = await client.query(
     `SELECT o.*, u.full_name AS created_by_name,
@@ -554,7 +591,7 @@ app.get('/api/separados/:id', requireAuth, h(async (req, res) => {
 }));
 
 app.post('/api/separados', requireAuth, h(async (req, res) => {
-  const { clientName, phone, items, initialPayment = 0, dueAt } = req.body || {};
+  const { clientName, phone, items, initialPayment = 0, initialPaymentMethod = 'efectivo', dueAt } = req.body || {};
   if (!clientName || !phone || !Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: 'Cliente, teléfono y al menos un producto son obligatorios' });
   }
@@ -563,6 +600,7 @@ app.post('/api/separados', requireAuth, h(async (req, res) => {
   }
   const paymentAmount = Number(initialPayment || 0);
   if (!Number.isFinite(paymentAmount) || paymentAmount < 0) return res.status(400).json({ error: 'El abono inicial no puede ser negativo ni inválido' });
+  if (!ACCOUNT_PAYMENT_METHODS.has(initialPaymentMethod)) return res.status(400).json({ error: 'Método de pago inválido' });
   if (dueAt && Number.isNaN(new Date(dueAt).getTime())) return res.status(400).json({ error: 'La fecha límite no es válida' });
   const paymentCents = toCents(paymentAmount);
   if (paymentCents > MAX_MONEY_CENTS) return res.status(400).json({ error: 'El abono inicial supera el valor máximo permitido' });
@@ -649,7 +687,7 @@ app.post('/api/separados', requireAuth, h(async (req, res) => {
            VALUES ($1, $2, $3, $4, $5)`
         : `INSERT INTO separated_payments (order_id, amount, payment_method, user_id, note)
            VALUES ($1, $2, $3, $4, $5)`;
-      await client.query(paymentQuery, [orderId, normalizedPayment, 'efectivo', req.session.userId, 'Abono inicial']);
+      await client.query(paymentQuery, [orderId, normalizedPayment, initialPaymentMethod, req.session.userId, 'Abono inicial']);
     }
 
     return { orderId, orderNumber, total, paidAmount: normalizedPayment, status: 'activo', due_at: dueDate.toISOString() };
@@ -658,9 +696,38 @@ app.post('/api/separados', requireAuth, h(async (req, res) => {
   res.json(result);
 }));
 
+app.post('/api/separados/:id/items', requireAuth, h(async (req, res) => {
+  const { items } = req.body || {};
+  if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'Agrega al menos un producto' });
+  const result = await withTransaction(async (client) => {
+    const { modern } = await getSeparatedSchemaInfo(client);
+    const orderRes = await client.query('SELECT * FROM separated_orders WHERE id = $1 FOR UPDATE', [req.params.id]);
+    const order = orderRes.rows[0];
+    if (!order) throw Object.assign(new Error('Separado no encontrado'), { statusCode: 404 });
+    if (order.status === 'anulado') throw Object.assign(new Error('No se pueden agregar productos a un separado anulado'), { statusCode: 400 });
+    const { preparedItems, totalCents: addedCents } = await prepareAccountItems(client, items, 'el separado');
+    const totalCents = toCents(order.total) + addedCents;
+    if (totalCents > MAX_MONEY_CENTS) throw Object.assign(new Error('El total del separado supera el valor máximo permitido'), { statusCode: 400 });
+    for (const item of preparedItems) {
+      await client.query(
+        modern
+          ? `INSERT INTO separated_order_items (separated_order_id, variant_id, product_reference, product_name, size, quantity, quantity_withdrawn, unit_price, subtotal)
+             VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8)`
+          : `INSERT INTO separated_order_items (order_id, variant_id, product_reference, product_name, size, quantity, retired_quantity, unit_price, subtotal)
+             VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8)`,
+        [order.id, item.variantId, item.productReference, item.productName, item.size || null, item.quantity, item.unitPrice, item.subtotal]
+      );
+    }
+    const total = fromCents(totalCents);
+    await client.query("UPDATE separated_orders SET total = $1, status = 'activo' WHERE id = $2", [total, order.id]);
+    return { orderId: order.id, total, addedTotal: fromCents(addedCents), status: 'activo' };
+  });
+  res.json(result);
+}));
+
 app.post('/api/separados/:id/pagos', requireAuth, h(async (req, res) => {
   const { amount, method = 'efectivo', note } = req.body || {};
-  if (!['efectivo', 'transferencia', 'addi', 'nequi', 'qr', 'daviplata'].includes(method)) {
+  if (!ACCOUNT_PAYMENT_METHODS.has(method)) {
     return res.status(400).json({ error: 'Método de pago inválido' });
   }
   const numericAmount = Number(amount);
@@ -818,7 +885,7 @@ app.get('/api/fiados/:id', requireAuth, h(async (req, res) => {
 }));
 
 app.post('/api/fiados', requireAuth, h(async (req, res) => {
-  const { clientName, phone, items, initialPayment = 0 } = req.body || {};
+  const { clientName, phone, items, initialPayment = 0, initialPaymentMethod = 'efectivo' } = req.body || {};
   if (!clientName || !phone || !Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: 'Cliente, teléfono y al menos un producto son obligatorios' });
   }
@@ -827,6 +894,7 @@ app.post('/api/fiados', requireAuth, h(async (req, res) => {
   }
   const paymentAmount = Number(initialPayment || 0);
   if (!Number.isFinite(paymentAmount) || paymentAmount < 0) return res.status(400).json({ error: 'El abono inicial no puede ser negativo ni inválido' });
+  if (!ACCOUNT_PAYMENT_METHODS.has(initialPaymentMethod)) return res.status(400).json({ error: 'Método de pago inválido' });
   const paymentCents = toCents(paymentAmount);
   if (paymentCents > MAX_MONEY_CENTS) return res.status(400).json({ error: 'El abono inicial supera el valor máximo permitido' });
 
@@ -898,7 +966,7 @@ app.post('/api/fiados', requireAuth, h(async (req, res) => {
       await client.query(
         `INSERT INTO credit_payments (credit_sale_id, amount, payment_method, user_id, note)
          VALUES ($1, $2, $3, $4, $5)`,
-        [creditId, fromCents(paymentCents), 'efectivo', req.session.userId, 'Abono inicial']
+        [creditId, fromCents(paymentCents), initialPaymentMethod, req.session.userId, 'Abono inicial']
       );
     }
 
@@ -908,9 +976,50 @@ app.post('/api/fiados', requireAuth, h(async (req, res) => {
   res.json(result);
 }));
 
+app.post('/api/fiados/:id/items', requireAuth, h(async (req, res) => {
+  const { items } = req.body || {};
+  if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'Agrega al menos un producto' });
+  const result = await withTransaction(async (client) => {
+    const { modern } = await getCreditSchemaInfo(client);
+    const creditRes = await client.query('SELECT * FROM credit_sales WHERE id = $1 FOR UPDATE', [req.params.id]);
+    const credit = creditRes.rows[0];
+    if (!credit) throw Object.assign(new Error('Fiado no encontrado'), { statusCode: 404 });
+    if (credit.status === 'anulado') throw Object.assign(new Error('No se pueden agregar productos a un fiado anulado'), { statusCode: 400 });
+    const { preparedItems, totalCents: addedCents } = await prepareAccountItems(client, items, 'el fiado');
+    const totalCents = toCents(credit.total) + addedCents;
+    if (totalCents > MAX_MONEY_CENTS) throw Object.assign(new Error('El total del fiado supera el valor máximo permitido'), { statusCode: 400 });
+    for (const item of preparedItems) {
+      await client.query(
+        `INSERT INTO credit_sale_items (credit_sale_id, variant_id, product_reference, product_name, size, quantity, unit_price, subtotal)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [credit.id, item.variantId, item.productReference, item.productName, item.size || null, item.quantity, item.unitPrice, item.subtotal]
+      );
+      await recordMovement(client, {
+        variantId: item.variantId,
+        type: 'venta',
+        quantityChange: -item.quantity,
+        reason: `Fiado ${credit.credit_number}`,
+        userId: req.session.userId,
+      });
+    }
+    const paidRes = await client.query('SELECT COALESCE(SUM(amount), 0)::numeric AS paid FROM credit_payments WHERE credit_sale_id = $1', [credit.id]);
+    const paidCents = toCents(Number(paidRes.rows[0].paid || 0));
+    const total = fromCents(totalCents);
+    const status = paidCents >= totalCents ? 'pagado' : 'pendiente';
+    await client.query(
+      modern
+        ? 'UPDATE credit_sales SET total = $1, status = $2 WHERE id = $3'
+        : 'UPDATE credit_sales SET total = $1, paid_amount = $2, status = $3 WHERE id = $4',
+      modern ? [total, status, credit.id] : [total, fromCents(paidCents), status, credit.id]
+    );
+    return { creditId: credit.id, total, addedTotal: fromCents(addedCents), paidAmount: fromCents(paidCents), status };
+  });
+  res.json(result);
+}));
+
 app.post('/api/fiados/:id/pagos', requireAuth, h(async (req, res) => {
   const { amount, method = 'efectivo', note } = req.body || {};
-  if (!['efectivo', 'transferencia', 'addi', 'nequi', 'qr', 'daviplata'].includes(method)) {
+  if (!ACCOUNT_PAYMENT_METHODS.has(method)) {
     return res.status(400).json({ error: 'Método de pago inválido' });
   }
   const numericAmount = Number(amount);
@@ -1398,6 +1507,7 @@ app.get('/api/dashboard', requireAuth, h(async (req, res) => {
     pool.query("SELECT COUNT(*)::int AS c FROM separated_orders WHERE status = 'activo' AND due_at < now()"),
   ]);
   res.json({
+    incomeToday: t.revenue,
     salesToday: t.revenue,
     salesCountToday: t.saleCount,
     itemsSoldToday: t.itemsSold,

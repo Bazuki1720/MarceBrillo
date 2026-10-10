@@ -11,7 +11,9 @@ const TEST_BAG_REFERENCE = `BOL-${TEST_RUN_ID}`;
 const TEST_PRICE_REFERENCE = `PRC-${TEST_RUN_ID}`;
 const TEST_CENTS_REFERENCE = `PRCC-${TEST_RUN_ID}`;
 const TEST_SELLER_USERNAME = `vendedora-${TEST_RUN_ID}`;
-const { businessDate, resolveRange } = require('../src/reports');
+const reports = require('../src/reports');
+const { businessDate, resolveRange } = reports;
+const { pool } = require('../src/db');
 const { toCents, fromCents } = require('../src/money');
 const { orderItemsByVariantId, recordMovement } = require('../src/inventoryLogic');
 
@@ -96,6 +98,34 @@ async function testMissingInventoryRow() {
   assert(updatedQuantity === 1 && quantity === 1 && calls[0].startsWith('INSERT INTO inventory'), 'Un movimiento reconstruye una fila de stock faltante sin conexión a datos reales');
 }
 
+async function testReportsIncludeAccountPayments() {
+  const originalQuery = pool.query;
+  const queries = [];
+  pool.query = async (sql) => {
+    queries.push(sql);
+    if (sql.includes('WITH payment_events')) return { rows: [{ payment_method: 'efectivo', payment_destination: null, transaction_count: 4, total: '120' }] };
+    if (sql.includes('WITH income_events')) return { rows: [{ period: '2026-10-01', total: '160', transaction_count: 4 }] };
+    if (sql.includes("FROM sales WHERE status = 'completada'")) return { rows: [{ total: '100', count: 2 }] };
+    if (sql.includes('FROM sale_items si')) return { rows: [{ qty: 4 }] };
+    if (sql.includes("status = 'anulada'")) return { rows: [{ count: 1, total: '20' }] };
+    if (sql.includes('FROM separated_payments') && sql.includes('UNION ALL')) return { rows: [{ count: 3, total: '90' }] };
+    throw new Error(`Consulta inesperada en prueba de reportes: ${sql}`);
+  };
+  try {
+    const totals = await reports.totals('2026-10-01', '2026-10-01');
+    assert(totals.revenue === 190 && totals.directSalesRevenue === 100 && totals.paymentRevenue === 90, 'Ingresos incluyen ventas directas y pagos de fiados/separados sin duplicar ventas');
+    assert(totals.saleCount === 2 && totals.paymentCount === 3 && totals.avgTicket === 50 && totals.itemsSold === 4, 'Métricas de ventas directas siguen separadas del número de abonos');
+    const summary = await reports.paymentSummary('2026-10-01', '2026-10-01');
+    assert(summary[0].transactionCount === 4 && summary[0].total === 120, 'Resumen por método agrega operaciones de pago');
+    const timeline = await reports.salesSummary('2026-10-01', '2026-10-01', 'day');
+    assert(timeline[0].total === 160 && timeline[0].transactionCount === 4, 'La cronología diaria incluye abonos recibidos');
+    assert(queries.some((sql) => sql.includes("payment_method = 'transferencia' AND payment_destination IS NOT NULL")), 'El resumen normaliza canales de transferencia entre ventas y abonos');
+    assert(queries.some((sql) => sql.includes('FROM credit_payments')) && queries.some((sql) => sql.includes('FROM separated_payments')), 'Los reportes consultan pagos de fiados y separados');
+  } finally {
+    pool.query = originalQuery;
+  }
+}
+
 async function run() {
   console.log('--- LOCAL DATE AND MONEY ---');
   assert(businessDate(new Date('2026-10-02T02:00:00Z')) === '2026-10-01', 'La fecha de negocio respeta la zona horaria de Colombia');
@@ -109,6 +139,7 @@ async function run() {
   const orderedItems = orderItemsByVariantId(unorderedItems);
   assert(orderedItems[0].variantId === 3 && unorderedItems[0].variantId === 20, 'El orden global de locks es estable y no muta el carrito');
   await testMissingInventoryRow();
+  await testReportsIncludeAccountPayments();
   if (!process.argv.includes('--e2e')) {
     console.log(`\n${passed} pruebas locales pasaron.`);
     if (failed > 0) process.exitCode = 1;
@@ -363,13 +394,35 @@ async function run() {
     assert(r.status === 200, 'Anular separado sin abonos ni retiros libera sus reservas');
   }
 
+  const reportDay = businessDate();
+  const separatedIncomeBefore = (await req('GET', `/api/reports/overview?from=${reportDay}&to=${reportDay}`)).data;
+  r = await req('POST', '/api/separados', {
+    clientName: 'Cuenta ampliada', phone: '3200003333',
+    items: [{ variantId: variant36.variant_id, quantity: 1, unitPrice: 150000 }],
+    initialPayment: 10000, initialPaymentMethod: 'daviplata',
+  });
+  assert(r.status === 200, 'El abono inicial de un separado acepta método de pago');
+  const expandableSeparatedId = r.data.orderId;
+  r = await req('POST', `/api/separados/${expandableSeparatedId}/items`, {
+    items: [{ variantId: variant36.variant_id, quantity: 1, unitPrice: 140000 }],
+  });
+  assert(r.status === 200 && r.data.total === 290000, 'Agregar productos amplía el total de la misma cuenta separada');
+  r = await req('POST', `/api/separados/${expandableSeparatedId}/pagos`, { amount: 20000, method: 'nequi' });
+  assert(r.status === 200, 'Un separado registra abonos posteriores con su método');
+  r = await req('GET', `/api/separados/${expandableSeparatedId}`);
+  assert(r.status === 200 && r.data.items.length === 2 && r.data.payments.some((payment) => payment.payment_method === 'daviplata') && r.data.payments.some((payment) => payment.payment_method === 'nequi'), 'El detalle conserva productos y canales de pago de la cuenta ampliada');
+  const separatedIncomeAfter = (await req('GET', `/api/reports/overview?from=${reportDay}&to=${reportDay}`)).data;
+  assert(separatedIncomeAfter.revenue - separatedIncomeBefore.revenue === 30000 && separatedIncomeAfter.paymentCount - separatedIncomeBefore.paymentCount === 2, 'Los ingresos diarios reflejan solo los abonos recibidos en separados');
+
   console.log('--- FIADOS ---');
+  const creditIncomeBefore = (await req('GET', `/api/reports/overview?from=${reportDay}&to=${reportDay}`)).data;
   r = await req('GET', '/api/products/' + productWithSizes.id);
   const stockBeforeCredit = r.data.variants.find((v) => v.size === '35').quantity;
   r = await req('POST', '/api/fiados', {
     clientName: 'Lucía',
     phone: '3117778888',
     items: [{ variantId: variant35.variant_id, quantity: 1, unitPrice: 150000 }],
+    initialPayment: 10000, initialPaymentMethod: 'qr',
   });
   assert(r.status === 200, 'Crear fiado descuenta inventario y guarda crédito');
   assert(r.data.creditNumber.startsWith('FIA-'), 'El fiado obtiene un número legible');
@@ -384,8 +437,24 @@ async function run() {
   r = await req('GET', '/api/fiados?q=' + encodeURIComponent(TEST_PRODUCT_REFERENCE));
   assert(r.status === 200 && r.data.some((credit) => credit.id === creditId), 'La búsqueda de fiados filtra por código del producto');
 
-  r = await req('POST', `/api/fiados/${creditId}/pagos`, { amount: 50000, method: 'efectivo' });
+  const priceStockBeforeCreditAdd = (await req('GET', `/api/products/${priceProduct.id}`)).data.variants[0].quantity;
+  r = await req('POST', `/api/fiados/${creditId}/items`, {
+    items: [{ variantId: priceProduct.variants[0].variant_id, quantity: 1, unitPrice: 170000 }],
+  });
+  assert(r.status === 200 && r.data.total === 320000, 'Agregar productos amplía la deuda en el mismo fiado existente');
+  r = await req('GET', `/api/fiados/${creditId}`);
+  assert(r.status === 200 && r.data.items.length === 2 && r.data.paid_amount === 10000 && r.data.balance === 310000, 'La cuenta ampliada conserva el abono y recalcula el saldo');
+  const priceStockAfterCreditAdd = (await req('GET', `/api/products/${priceProduct.id}`)).data.variants[0].quantity;
+  assert(priceStockAfterCreditAdd === priceStockBeforeCreditAdd - 1, 'Agregar al fiado descuenta el inventario del nuevo producto');
+
+  r = await req('POST', `/api/fiados/${creditId}/pagos`, { amount: 50000, method: 'addi' });
   assert(r.status === 200, 'Registrar abono del fiado funciona');
+  r = await req('GET', `/api/fiados/${creditId}`);
+  assert(r.data.payments.some((payment) => payment.payment_method === 'qr') && r.data.payments.some((payment) => payment.payment_method === 'addi'), 'El historial del fiado identifica el método de cada ingreso');
+  const creditIncomeAfter = (await req('GET', `/api/reports/overview?from=${reportDay}&to=${reportDay}`)).data;
+  assert(creditIncomeAfter.revenue - creditIncomeBefore.revenue === 60000 && creditIncomeAfter.paymentCount - creditIncomeBefore.paymentCount === 2, 'Los abonos inicial y posterior del fiado se reflejan como ingresos diarios');
+  r = await req('GET', '/api/dashboard');
+  assert(r.status === 200 && r.data.incomeToday === creditIncomeAfter.revenue, 'Dashboard y reporte coinciden en ingresos del día');
 
   r = await req('POST', `/api/fiados/${creditId}/anular`, { reason: 'Prueba de devolución' });
   assert(r.status === 400, 'No permite anular un fiado con pagos registrados');

@@ -259,8 +259,10 @@ CREATE INDEX IF NOT EXISTS idx_movements_variant ON inventory_movements(variant_
 CREATE INDEX IF NOT EXISTS idx_movements_created ON inventory_movements(created_at);
 CREATE INDEX IF NOT EXISTS idx_separated_orders_status ON separated_orders(status);
 CREATE INDEX IF NOT EXISTS idx_separated_order_items_variant ON separated_order_items(variant_id);
+CREATE INDEX IF NOT EXISTS idx_separated_payments_created ON separated_payments(created_at);
 CREATE INDEX IF NOT EXISTS idx_credit_sales_status ON credit_sales(status);
 CREATE INDEX IF NOT EXISTS idx_credit_sale_items_variant ON credit_sale_items(variant_id);
+CREATE INDEX IF NOT EXISTS idx_credit_payments_created ON credit_payments(created_at);
 
 -- Migration safety net: add category_id to sale_items if it didn't exist yet
 -- (older databases created before reports were added).

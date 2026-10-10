@@ -147,8 +147,8 @@ async function renderDashboard() {
     <p class="hello">Hola, ${escapeHtml(CURRENT_USER.fullName.split(' ')[0])} 👋</p>
     <div class="stat-grid">
       <div class="card stat-card">
-        <div class="label">Ventas de hoy</div>
-        <div class="value">${fmtMoney(data.salesToday)}</div>
+        <div class="label">Ingresos de hoy</div>
+        <div class="value">${fmtMoney(data.incomeToday ?? data.salesToday)}</div>
       </div>
       <div class="card stat-card">
         <div class="label">Productos vendidos hoy</div>
@@ -256,10 +256,13 @@ async function renderSeparatedDetail(id) {
       </div>
     `).join('')}
     <div style="display:flex;gap:10px;flex-wrap:wrap;margin:20px 0">
+      ${order.status !== 'anulado' ? `<button class="btn btn-outline" onclick="openAccountItemsModal('separados', ${order.id})">➕ Agregar productos</button>` : ''}
       ${order.status !== 'anulado' && Number(order.balance) > 0 ? `<button class="btn btn-primary" onclick="openSeparatedPayment(${order.id})">💰 Abonar</button>` : ''}
       ${order.status === 'activo' && order.items.some((item) => item.quantity > item.retired_quantity) ? `<button class="btn btn-outline" onclick="openSeparatedRetiro(${order.id})">📦 Retirar</button>` : ''}
       ${order.status === 'activo' && Number(order.paid_amount) === 0 && order.items.every((item) => Number(item.retired_quantity) === 0) ? `<button class="btn btn-danger" onclick="openSeparatedCancel(${order.id})">🚫 Anular</button>` : ''}
     </div>
+    <h3>Historial de pagos</h3>
+    ${order.payments.length ? order.payments.map((payment) => `<div class="product-item"><strong>${fmtMoney(payment.amount)}</strong><div class="meta">${new Date(payment.created_at).toLocaleString('es-CO')} · ${escapeHtml(paymentLabel(payment.payment_method, payment.payment_destination))}${payment.note ? ' · ' + escapeHtml(payment.note) : ''}</div></div>`).join('') : '<p class="helper-text">Sin abonos registrados.</p>'}
   `;
 }
 
@@ -333,9 +336,12 @@ async function renderCreditDetail(id) {
       </div>
     `).join('')}
     <div style="display:flex;gap:10px;flex-wrap:wrap;margin:20px 0">
+      ${credit.status !== 'anulado' ? `<button class="btn btn-outline" onclick="openAccountItemsModal('fiados', ${credit.id})">➕ Agregar productos</button>` : ''}
       ${credit.status !== 'anulado' && Number(credit.balance) > 0 ? `<button class="btn btn-primary" onclick="openFiadoPayment(${credit.id})">💰 Abonar</button>` : ''}
       ${credit.status !== 'anulado' && Number(credit.paid_amount) === 0 ? `<button class="btn btn-danger" onclick="openFiadoCancel(${credit.id})">🚫 Anular</button>` : ''}
     </div>
+    <h3>Historial de pagos</h3>
+    ${credit.payments.length ? credit.payments.map((payment) => `<div class="product-item"><strong>${fmtMoney(payment.amount)}</strong><div class="meta">${new Date(payment.created_at).toLocaleString('es-CO')} · ${escapeHtml(paymentLabel(payment.payment_method, payment.payment_destination))}${payment.note ? ' · ' + escapeHtml(payment.note) : ''}</div></div>`).join('') : '<p class="helper-text">Sin abonos registrados.</p>'}
   `;
 }
 
@@ -361,6 +367,7 @@ async function openSeparatedModal() {
       <button id="sepAddItem" class="btn btn-outline btn-block" type="button">Agregar producto</button>
       <div id="sepItems" class="search-results" style="margin:10px 0"></div>
       <div class="field"><label>Abono inicial</label><input id="sepInitialPayment" type="number" min="0" step="1" value="0" /></div>
+      <div class="field"><label>Método del abono inicial</label><select id="sepInitialMethod">${accountPaymentMethodOptions()}</select></div>
       <div class="field"><label>Fecha límite</label><input id="sepDueAt" type="date" /></div>
       <button class="btn btn-primary btn-block" type="submit">Guardar separado</button>
     </form>
@@ -440,6 +447,7 @@ async function openSeparatedModal() {
         phone: document.getElementById('sepPhone').value,
         items: selectedItems.map(({ label, ...item }) => item),
         initialPayment: Number(document.getElementById('sepInitialPayment').value || 0),
+        initialPaymentMethod: document.getElementById('sepInitialMethod').value,
         dueAt: document.getElementById('sepDueAt').value || null,
       });
       closeModal();
@@ -471,6 +479,7 @@ async function openFiadoModal() {
       <button id="fiaAddItem" class="btn btn-outline btn-block" type="button">Agregar producto</button>
       <div id="fiaItems" class="search-results" style="margin:10px 0"></div>
       <div class="field"><label>Abono inicial</label><input id="fiaInitialPayment" type="number" min="0" step="1" value="0" /></div>
+      <div class="field"><label>Método del abono inicial</label><select id="fiaInitialMethod">${accountPaymentMethodOptions()}</select></div>
       <button class="btn btn-primary btn-block" type="submit">Guardar fiado</button>
     </form>
   `);
@@ -549,6 +558,7 @@ async function openFiadoModal() {
         phone: document.getElementById('fiaPhone').value,
         items: selectedItems.map(({ label, ...item }) => item),
         initialPayment: Number(document.getElementById('fiaInitialPayment').value || 0),
+        initialPaymentMethod: document.getElementById('fiaInitialMethod').value,
       });
       closeModal();
       toast('Fiado creado', 'success');
@@ -562,12 +572,13 @@ function openSeparatedPayment(id) {
     <h3>Abonar separado</h3>
     <form id="sepPaymentForm">
       <div class="field"><label>Valor</label><input id="sepPaymentAmount" type="number" min="1" step="1" required /></div>
+      <div class="field"><label>Método de pago</label><select id="sepPaymentMethod">${accountPaymentMethodOptions()}</select></div>
       <button class="btn btn-primary btn-block" type="submit">Registrar abono</button>
     </form>
   `);
   document.getElementById('sepPaymentForm').addEventListener('submit', async (e) => {
     e.preventDefault();
-    try { await api.post('/api/separados/' + id + '/pagos', { amount: Number(document.getElementById('sepPaymentAmount').value) }); closeModal(); toast('Abono registrado', 'success'); renderSeparatedDetail(id); } catch (err) { toast(err.message, 'error'); }
+    try { await api.post('/api/separados/' + id + '/pagos', { amount: Number(document.getElementById('sepPaymentAmount').value), method: document.getElementById('sepPaymentMethod').value }); closeModal(); toast('Abono registrado', 'success'); renderSeparatedDetail(id); } catch (err) { toast(err.message, 'error'); }
   });
 }
 
@@ -576,12 +587,76 @@ function openFiadoPayment(id) {
     <h3>Abonar fiado</h3>
     <form id="fiaPaymentForm">
       <div class="field"><label>Valor</label><input id="fiaPaymentAmount" type="number" min="1" step="1" required /></div>
+      <div class="field"><label>Método de pago</label><select id="fiaPaymentMethod">${accountPaymentMethodOptions()}</select></div>
       <button class="btn btn-primary btn-block" type="submit">Registrar abono</button>
     </form>
   `);
   document.getElementById('fiaPaymentForm').addEventListener('submit', async (e) => {
     e.preventDefault();
-    try { await api.post('/api/fiados/' + id + '/pagos', { amount: Number(document.getElementById('fiaPaymentAmount').value) }); closeModal(); toast('Abono registrado', 'success'); renderCreditDetail(id); } catch (err) { toast(err.message, 'error'); }
+    try { await api.post('/api/fiados/' + id + '/pagos', { amount: Number(document.getElementById('fiaPaymentAmount').value), method: document.getElementById('fiaPaymentMethod').value }); closeModal(); toast('Abono registrado', 'success'); renderCreditDetail(id); } catch (err) { toast(err.message, 'error'); }
+  });
+}
+
+async function openAccountItemsModal(type, id) {
+  const products = await api.get('/api/products');
+  const entries = (products || []).filter((product) => product.status === 'activo').flatMap((product) =>
+    (product.variants || []).filter((variant) => Number(variant.available_quantity) > 0).map((variant) => ({ product, variant }))
+  );
+  if (!entries.length) return toast('No hay productos disponibles para agregar.', 'error');
+  const selectedItems = [];
+  showModal(`
+    <h3>Agregar productos a la cuenta</h3>
+    <form id="accountItemsForm">
+      <div class="field"><label>Producto</label><select id="accountItemVariant" required><option value="">Selecciona un producto</option>${entries.map(({ product, variant }) => `<option value="${variant.variant_id}">${escapeHtml(product.reference)}${variant.size ? ' · talla ' + escapeHtml(variant.size) : ''} · ${escapeHtml(product.name)} · ${variant.available_quantity} disp.</option>`).join('')}</select></div>
+      <div class="field"><label>Cantidad</label><input id="accountItemQuantity" type="number" min="1" step="1" value="1" required /></div>
+      <div class="field"><label>Precio unitario</label><input id="accountItemPrice" type="number" min="0" step="1" required /></div>
+      <button id="accountItemAdd" class="btn btn-outline btn-block" type="button">Agregar a la lista</button>
+      <div id="accountItemList" class="search-results" style="margin:10px 0"></div>
+      <button class="btn btn-primary btn-block" type="submit">Guardar productos</button>
+    </form>
+  `);
+  const variantSelect = document.getElementById('accountItemVariant');
+  const priceInput = document.getElementById('accountItemPrice');
+  const list = document.getElementById('accountItemList');
+  variantSelect.addEventListener('change', () => {
+    const entry = entries.find(({ variant }) => Number(variant.variant_id) === Number(variantSelect.value));
+    if (entry) priceInput.value = String(entry.product.price);
+  });
+  const renderItems = () => {
+    list.innerHTML = selectedItems.length
+      ? selectedItems.map((item, index) => `<div class="product-item" style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:8px 10px"><span>${escapeHtml(item.label)} · ${item.quantity} × ${fmtMoney(item.unitPrice)}</span><button type="button" class="btn btn-danger" data-remove-account-item="${index}">Quitar</button></div>`).join('')
+      : '<p class="helper-text">Aún no hay productos seleccionados.</p>';
+    list.querySelectorAll('[data-remove-account-item]').forEach((button) => button.addEventListener('click', () => {
+      selectedItems.splice(Number(button.dataset.removeAccountItem), 1);
+      renderItems();
+    }));
+  };
+  renderItems();
+  document.getElementById('accountItemAdd').addEventListener('click', () => {
+    const entry = entries.find(({ variant }) => Number(variant.variant_id) === Number(variantSelect.value));
+    const quantity = Number(document.getElementById('accountItemQuantity').value);
+    const unitPrice = Number(priceInput.value);
+    if (!entry) return toast('Selecciona un producto.', 'error');
+    if (!Number.isInteger(quantity) || quantity <= 0 || !Number.isFinite(unitPrice) || unitPrice < 0) return toast('Revisa la cantidad y el precio.', 'error');
+    selectedItems.push({
+      variantId: Number(entry.variant.variant_id),
+      quantity,
+      unitPrice,
+      label: `${entry.product.reference}${entry.variant.size ? ' · talla ' + entry.variant.size : ''}`,
+    });
+    renderItems();
+    variantSelect.value = '';
+  });
+  document.getElementById('accountItemsForm').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    try {
+      if (!selectedItems.length) throw new Error('Agrega al menos un producto.');
+      await api.post(`/api/${type}/${id}/items`, { items: selectedItems.map(({ label, ...item }) => item) });
+      closeModal();
+      toast('Productos agregados a la cuenta', 'success');
+      if (type === 'separados') await renderSeparatedDetail(id);
+      else await renderCreditDetail(id);
+    } catch (error) { toast(error.message, 'error'); }
   });
 }
 
@@ -794,7 +869,7 @@ function movementRow(m) {
 }
 function capitalize(s) { return s ? s.charAt(0).toUpperCase() + s.slice(1) : s; }
 function paymentMethodLabel(method) {
-  return ({ efectivo: 'Efectivo', transferencia: 'Transferencia', addi: 'Addi' }[method] || 'No especificado');
+  return ({ efectivo: 'Efectivo', transferencia: 'Transferencia', addi: 'Addi', nequi: 'Transferencia · Nequi', qr: 'Transferencia · QR', daviplata: 'Transferencia · Daviplata' }[method] || 'No especificado');
 }
 function paymentDestinationLabel(destination) {
   return ({ nequi: 'Nequi', qr: 'QR', daviplata: 'Daviplata' }[destination] || '');
@@ -802,6 +877,9 @@ function paymentDestinationLabel(destination) {
 function paymentLabel(method, destination) {
   const label = paymentMethodLabel(method);
   return method === 'transferencia' && destination ? `${label} · ${paymentDestinationLabel(destination)}` : label;
+}
+function accountPaymentMethodOptions() {
+  return '<option value="efectivo">Efectivo</option><option value="transferencia">Transferencia</option><option value="nequi">Transferencia · Nequi</option><option value="qr">Transferencia · QR</option><option value="daviplata">Transferencia · Daviplata</option><option value="addi">Addi</option>';
 }
 
 function openEntryModal(productId) {
@@ -1509,16 +1587,16 @@ async function loadReportBody() {
         <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;${i > 0 ? 'border-top:1px solid var(--line)' : ''}">
           <div>
             <div style="font-weight:700">${escapeHtml(paymentLabel(p.method, p.destination))}</div>
-            <div class="meta">${p.saleCount} ${p.saleCount === 1 ? 'venta' : 'ventas'}</div>
+            <div class="meta">${p.transactionCount} ${p.transactionCount === 1 ? 'operación' : 'operaciones'}</div>
           </div>
           <div style="font-weight:700">${fmtMoney(p.total)}</div>
         </div>
       `).join('')}
     </div>
 
-    <h3>Ventas por día</h3>
+    <h3>Ingresos por día</h3>
     <div class="card" style="margin-bottom:24px">
-      ${timeline.length === 0 ? '<p class="helper-text">No hay ventas en este período.</p>' : barChartSvg(timeline)}
+      ${timeline.length === 0 ? '<p class="helper-text">No hay ingresos en este período.</p>' : barChartSvg(timeline)}
     </div>
 
     <h3>Productos más vendidos</h3>
