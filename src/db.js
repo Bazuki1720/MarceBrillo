@@ -222,6 +222,36 @@ CREATE TABLE IF NOT EXISTS credit_payments (
   note TEXT
 );
 
+CREATE TABLE IF NOT EXISTS separated_payment_allocations (
+  id SERIAL PRIMARY KEY,
+  separated_payment_id INTEGER NOT NULL REFERENCES separated_payments(id) ON DELETE CASCADE,
+  separated_order_item_id INTEGER NOT NULL REFERENCES separated_order_items(id) ON DELETE CASCADE,
+  amount NUMERIC(12,2) NOT NULL CHECK (amount > 0),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (separated_payment_id)
+);
+
+CREATE TABLE IF NOT EXISTS credit_payment_allocations (
+  id SERIAL PRIMARY KEY,
+  credit_payment_id INTEGER NOT NULL REFERENCES credit_payments(id) ON DELETE CASCADE,
+  credit_sale_item_id INTEGER NOT NULL REFERENCES credit_sale_items(id) ON DELETE CASCADE,
+  amount NUMERIC(12,2) NOT NULL CHECK (amount > 0),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (credit_payment_id)
+);
+
+CREATE TABLE IF NOT EXISTS account_refunds (
+  id SERIAL PRIMARY KEY,
+  separated_order_id INTEGER REFERENCES separated_orders(id),
+  credit_sale_id INTEGER REFERENCES credit_sales(id),
+  amount NUMERIC(12,2) NOT NULL CHECK (amount > 0),
+  payment_method TEXT NOT NULL CHECK (payment_method IN ('efectivo','transferencia','addi','nequi','qr','daviplata')),
+  reason TEXT NOT NULL,
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CHECK ((separated_order_id IS NOT NULL)::int + (credit_sale_id IS NOT NULL)::int = 1)
+);
+
 CREATE OR REPLACE FUNCTION notify_marce_brillo_change() RETURNS trigger AS $$
 BEGIN
   PERFORM pg_notify('marce_brillo_changes', TG_TABLE_NAME);
@@ -237,7 +267,8 @@ BEGIN
     'categories', 'users', 'products', 'product_variants', 'inventory',
     'sales', 'sale_items', 'inventory_movements', 'separated_orders',
     'separated_order_items', 'separated_payments', 'credit_sales',
-    'credit_sale_items', 'credit_payments'
+    'credit_sale_items', 'credit_payments', 'separated_payment_allocations',
+    'credit_payment_allocations', 'account_refunds'
   ]
   LOOP
     EXECUTE format('DROP TRIGGER IF EXISTS marce_brillo_change ON %I', table_name);
@@ -260,9 +291,12 @@ CREATE INDEX IF NOT EXISTS idx_movements_created ON inventory_movements(created_
 CREATE INDEX IF NOT EXISTS idx_separated_orders_status ON separated_orders(status);
 CREATE INDEX IF NOT EXISTS idx_separated_order_items_variant ON separated_order_items(variant_id);
 CREATE INDEX IF NOT EXISTS idx_separated_payments_created ON separated_payments(created_at);
+CREATE INDEX IF NOT EXISTS idx_separated_allocations_item ON separated_payment_allocations(separated_order_item_id);
 CREATE INDEX IF NOT EXISTS idx_credit_sales_status ON credit_sales(status);
 CREATE INDEX IF NOT EXISTS idx_credit_sale_items_variant ON credit_sale_items(variant_id);
 CREATE INDEX IF NOT EXISTS idx_credit_payments_created ON credit_payments(created_at);
+CREATE INDEX IF NOT EXISTS idx_credit_allocations_item ON credit_payment_allocations(credit_sale_item_id);
+CREATE INDEX IF NOT EXISTS idx_account_refunds_created ON account_refunds(created_at);
 
 -- Migration safety net: add category_id to sale_items if it didn't exist yet
 -- (older databases created before reports were added).

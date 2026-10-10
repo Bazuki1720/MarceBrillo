@@ -52,6 +52,8 @@ async function salesSummary(from, to, groupBy) {
        SELECT created_at AS occurred_at, amount FROM separated_payments
        UNION ALL
        SELECT created_at AS occurred_at, amount FROM credit_payments
+      UNION ALL
+      SELECT created_at AS occurred_at, -amount AS amount FROM account_refunds
      )
      SELECT date_trunc($3, occurred_at AT TIME ZONE 'America/Bogota') as period,
             COALESCE(SUM(amount), 0) as total,
@@ -74,11 +76,15 @@ async function totals(from, to) {
     [fromDate, toDate]
     ),
     pool.query(
-      `SELECT COUNT(*)::int AS count, COALESCE(SUM(amount), 0) AS total
+            `SELECT COUNT(*) FILTER (WHERE amount > 0)::int AS count,
+              COALESCE(SUM(amount) FILTER (WHERE amount > 0), 0) AS total,
+              COALESCE(SUM(-amount) FILTER (WHERE amount < 0), 0) AS refund_total
        FROM (
-         SELECT amount, created_at FROM separated_payments
+        SELECT amount, created_at FROM separated_payments
          UNION ALL
-         SELECT amount, created_at FROM credit_payments
+        SELECT amount, created_at FROM credit_payments
+        UNION ALL
+        SELECT -amount AS amount, created_at FROM account_refunds
        ) payments
        WHERE created_at BETWEEN $1 AND $2`,
       [fromDate, toDate]
@@ -97,10 +103,12 @@ async function totals(from, to) {
   ]);
   const directSalesRevenue = Number(salesRes.rows[0].total);
   const paymentRevenue = Number(paymentsRes.rows[0].total);
+  const refundTotal = Number(paymentsRes.rows[0].refund_total || 0);
   return {
     revenue: directSalesRevenue + paymentRevenue,
     directSalesRevenue,
     paymentRevenue,
+    refundTotal,
     paymentCount: paymentsRes.rows[0].count,
     saleCount: salesRes.rows[0].count,
     itemsSold: itemsRes.rows[0].qty,
@@ -147,19 +155,23 @@ async function paymentSummary(from, to) {
   const { fromDate, toDate } = resolveRange(from, to);
   const { rows } = await pool.query(
     `WITH payment_events AS (
-       SELECT CASE
+      SELECT CASE
                 WHEN payment_method = 'transferencia' AND payment_destination IS NOT NULL THEN payment_destination
                 ELSE payment_method
               END AS payment_method,
-              NULL::text AS payment_destination, total AS amount, created_at
+        NULL::text AS payment_destination, total AS amount, created_at, 'ingreso'::text AS event_type
        FROM sales WHERE status = 'completada'
        UNION ALL
-       SELECT payment_method, NULL::text AS payment_destination, amount, created_at FROM separated_payments
+      SELECT payment_method, NULL::text AS payment_destination, amount, created_at, 'ingreso'::text AS event_type FROM separated_payments
        UNION ALL
-       SELECT payment_method, NULL::text AS payment_destination, amount, created_at FROM credit_payments
+      SELECT payment_method, NULL::text AS payment_destination, amount, created_at, 'ingreso'::text AS event_type FROM credit_payments
+      UNION ALL
+      SELECT payment_method, NULL::text AS payment_destination, -amount AS amount, created_at, 'devolucion'::text AS event_type FROM account_refunds
      )
      SELECT payment_method, payment_destination,
-            COUNT(*)::int as transaction_count, COALESCE(SUM(amount), 0) as total
+           COUNT(*) FILTER (WHERE event_type = 'ingreso')::int AS transaction_count,
+           COALESCE(SUM(-amount) FILTER (WHERE event_type = 'devolucion'), 0) AS refund_total,
+           COALESCE(SUM(amount), 0) as total
      FROM payment_events
      WHERE created_at BETWEEN $1 AND $2
      GROUP BY payment_method, payment_destination
@@ -170,6 +182,7 @@ async function paymentSummary(from, to) {
     method: r.payment_method,
     destination: r.payment_destination,
     transactionCount: r.transaction_count,
+    refundTotal: Number(r.refund_total || 0),
     total: Number(r.total),
   }));
 }

@@ -209,7 +209,7 @@ async function renderSeparatedOrders(searchTerm = '') {
         <div class="meta">${escapeHtml(order.phone)} · ${new Date(order.created_at).toLocaleDateString('es-CO')} · vence ${new Date(order.due_at).toLocaleDateString('es-CO')}</div>
         <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-top:8px">
           <div class="total-stock">Total: ${fmtMoney(order.total)} · Pagado: ${fmtMoney(order.paid_amount)} · Saldo: ${fmtMoney(order.balance || 0)}</div>
-          ${order.status === 'activo' && Number(order.paid_amount) === 0 ? `<button class="btn btn-danger" onclick="event.stopPropagation(); openSeparatedCancel(${order.id});">🚫 Anular</button>` : ''}
+          ${order.status === 'activo' ? `<button class="btn btn-danger" onclick="event.stopPropagation(); openSeparatedCancel(${order.id});">🚫 Anular</button>` : ''}
         </div>
       </div>
     `).join('')}
@@ -251,18 +251,20 @@ async function renderSeparatedDetail(id) {
       <div class="product-item">
         <div class="ref">${escapeHtml(item.product_reference)}</div>
         <div class="name">${escapeHtml(item.product_name)} ${item.size ? '· talla ' + escapeHtml(item.size) : ''}</div>
-        <div class="meta">Cantidad: ${item.quantity} · Retirada: ${item.retired_quantity} · Pendiente: ${item.quantity - item.retired_quantity}</div>
-        <div class="meta">${fmtMoney(item.unit_price)} × ${item.quantity} = ${fmtMoney(item.subtotal)}</div>
+        <div class="meta">Cantidad: ${item.quantity} · Retirada: ${item.retired_quantity} · Pendiente de retirar: ${item.quantity - item.retired_quantity}</div>
+        <div class="meta">${fmtMoney(item.unit_price)} × ${item.quantity} = ${fmtMoney(item.subtotal)} · Abonado a este producto: ${fmtMoney(item.allocated_amount || 0)} · Saldo de producto: ${fmtMoney(item.item_balance ?? item.subtotal)}</div>
       </div>
     `).join('')}
     <div style="display:flex;gap:10px;flex-wrap:wrap;margin:20px 0">
       ${order.status !== 'anulado' ? `<button class="btn btn-outline" onclick="openAccountItemsModal('separados', ${order.id})">➕ Agregar productos</button>` : ''}
       ${order.status !== 'anulado' && Number(order.balance) > 0 ? `<button class="btn btn-primary" onclick="openSeparatedPayment(${order.id})">💰 Abonar</button>` : ''}
       ${order.status === 'activo' && order.items.some((item) => item.quantity > item.retired_quantity) ? `<button class="btn btn-outline" onclick="openSeparatedRetiro(${order.id})">📦 Retirar</button>` : ''}
-      ${order.status === 'activo' && Number(order.paid_amount) === 0 && order.items.every((item) => Number(item.retired_quantity) === 0) ? `<button class="btn btn-danger" onclick="openSeparatedCancel(${order.id})">🚫 Anular</button>` : ''}
+      ${order.status !== 'anulado' && order.items.some((item) => Number(item.retired_quantity) > 0) ? `<button class="btn btn-outline" onclick="openSeparatedReturn(${order.id})">↩️ Devolver producto</button>` : ''}
+      ${order.status === 'activo' ? `<button class="btn btn-danger" onclick="openSeparatedCancel(${order.id})">🚫 Anular</button>` : ''}
     </div>
     <h3>Historial de pagos</h3>
-    ${order.payments.length ? order.payments.map((payment) => `<div class="product-item"><strong>${fmtMoney(payment.amount)}</strong><div class="meta">${new Date(payment.created_at).toLocaleString('es-CO')} · ${escapeHtml(paymentLabel(payment.payment_method, payment.payment_destination))}${payment.note ? ' · ' + escapeHtml(payment.note) : ''}</div></div>`).join('') : '<p class="helper-text">Sin abonos registrados.</p>'}
+    ${order.payments.length ? order.payments.map((payment) => `<div class="product-item"><strong>${fmtMoney(payment.amount)}</strong><div class="meta">${new Date(payment.created_at).toLocaleString('es-CO')} · ${escapeHtml(paymentLabel(payment.payment_method, payment.payment_destination))} · ${payment.allocated_product_reference ? 'Aplicado a ' + escapeHtml(payment.allocated_product_reference) : 'Abono a cuenta completa'}${payment.user_name ? ' · ' + escapeHtml(payment.user_name) : ''}${payment.note ? ' · ' + escapeHtml(payment.note) : ''}</div></div>`).join('') : '<p class="helper-text">Sin abonos registrados.</p>'}
+    ${order.refunds?.length ? `<h3>Devoluciones</h3>${order.refunds.map((refund) => `<div class="product-item"><strong>−${fmtMoney(refund.amount)}</strong><div class="meta">${new Date(refund.created_at).toLocaleString('es-CO')} · ${escapeHtml(paymentLabel(refund.payment_method))} · ${escapeHtml(refund.reason)}${refund.user_name ? ' · ' + escapeHtml(refund.user_name) : ''}</div></div>`).join('')}` : ''}
   `;
 }
 
@@ -291,7 +293,7 @@ async function renderCreditSales(searchTerm = '') {
         <div class="meta">${escapeHtml(credit.phone)} · ${new Date(credit.created_at).toLocaleDateString('es-CO')}</div>
         <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-top:8px">
           <div class="total-stock">Total: ${fmtMoney(credit.total)} · Pagado: ${fmtMoney(credit.paid_amount)} · Saldo: ${fmtMoney(credit.balance || 0)}</div>
-          ${credit.status !== 'anulado' && Number(credit.paid_amount) === 0 ? `<button class="btn btn-danger" onclick="event.stopPropagation(); openFiadoCancel(${credit.id});">🚫 Anular</button>` : ''}
+          ${credit.status !== 'anulado' ? `<button class="btn btn-danger" onclick="event.stopPropagation(); openFiadoCancel(${credit.id});">🚫 Anular</button>` : ''}
         </div>
       </div>
     `).join('')}
@@ -332,16 +334,17 @@ async function renderCreditDetail(id) {
       <div class="product-item">
         <div class="ref">${escapeHtml(item.product_reference)}</div>
         <div class="name">${escapeHtml(item.product_name)} ${item.size ? '· talla ' + escapeHtml(item.size) : ''}</div>
-        <div class="meta">Cantidad: ${item.quantity} · ${fmtMoney(item.unit_price)} c/u = ${fmtMoney(item.subtotal)}</div>
+        <div class="meta">Cantidad: ${item.quantity} · ${fmtMoney(item.unit_price)} c/u = ${fmtMoney(item.subtotal)} · Abonado a este producto: ${fmtMoney(item.allocated_amount || 0)} · Saldo de producto: ${fmtMoney(item.item_balance ?? item.subtotal)}</div>
       </div>
     `).join('')}
     <div style="display:flex;gap:10px;flex-wrap:wrap;margin:20px 0">
       ${credit.status !== 'anulado' ? `<button class="btn btn-outline" onclick="openAccountItemsModal('fiados', ${credit.id})">➕ Agregar productos</button>` : ''}
       ${credit.status !== 'anulado' && Number(credit.balance) > 0 ? `<button class="btn btn-primary" onclick="openFiadoPayment(${credit.id})">💰 Abonar</button>` : ''}
-      ${credit.status !== 'anulado' && Number(credit.paid_amount) === 0 ? `<button class="btn btn-danger" onclick="openFiadoCancel(${credit.id})">🚫 Anular</button>` : ''}
+      ${credit.status !== 'anulado' ? `<button class="btn btn-danger" onclick="openFiadoCancel(${credit.id})">🚫 Anular</button>` : ''}
     </div>
     <h3>Historial de pagos</h3>
-    ${credit.payments.length ? credit.payments.map((payment) => `<div class="product-item"><strong>${fmtMoney(payment.amount)}</strong><div class="meta">${new Date(payment.created_at).toLocaleString('es-CO')} · ${escapeHtml(paymentLabel(payment.payment_method, payment.payment_destination))}${payment.note ? ' · ' + escapeHtml(payment.note) : ''}</div></div>`).join('') : '<p class="helper-text">Sin abonos registrados.</p>'}
+    ${credit.payments.length ? credit.payments.map((payment) => `<div class="product-item"><strong>${fmtMoney(payment.amount)}</strong><div class="meta">${new Date(payment.created_at).toLocaleString('es-CO')} · ${escapeHtml(paymentLabel(payment.payment_method, payment.payment_destination))} · ${payment.allocated_product_reference ? 'Aplicado a ' + escapeHtml(payment.allocated_product_reference) : 'Abono a cuenta completa'}${payment.user_name ? ' · ' + escapeHtml(payment.user_name) : ''}${payment.note ? ' · ' + escapeHtml(payment.note) : ''}</div></div>`).join('') : '<p class="helper-text">Sin abonos registrados.</p>'}
+    ${credit.refunds?.length ? `<h3>Devoluciones</h3>${credit.refunds.map((refund) => `<div class="product-item"><strong>−${fmtMoney(refund.amount)}</strong><div class="meta">${new Date(refund.created_at).toLocaleString('es-CO')} · ${escapeHtml(paymentLabel(refund.payment_method))} · ${escapeHtml(refund.reason)}${refund.user_name ? ' · ' + escapeHtml(refund.user_name) : ''}</div></div>`).join('')}` : ''}
   `;
 }
 
@@ -567,34 +570,57 @@ async function openFiadoModal() {
   });
 }
 
-function openSeparatedPayment(id) {
-  showModal(`
-    <h3>Abonar separado</h3>
-    <form id="sepPaymentForm">
-      <div class="field"><label>Valor</label><input id="sepPaymentAmount" type="number" min="1" step="1" required /></div>
-      <div class="field"><label>Método de pago</label><select id="sepPaymentMethod">${accountPaymentMethodOptions()}</select></div>
-      <button class="btn btn-primary btn-block" type="submit">Registrar abono</button>
-    </form>
-  `);
-  document.getElementById('sepPaymentForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    try { await api.post('/api/separados/' + id + '/pagos', { amount: Number(document.getElementById('sepPaymentAmount').value), method: document.getElementById('sepPaymentMethod').value }); closeModal(); toast('Abono registrado', 'success'); renderSeparatedDetail(id); } catch (err) { toast(err.message, 'error'); }
-  });
-}
+function openSeparatedPayment(id) { openAccountPayment('separados', id); }
+function openFiadoPayment(id) { openAccountPayment('fiados', id); }
 
-function openFiadoPayment(id) {
-  showModal(`
-    <h3>Abonar fiado</h3>
-    <form id="fiaPaymentForm">
-      <div class="field"><label>Valor</label><input id="fiaPaymentAmount" type="number" min="1" step="1" required /></div>
-      <div class="field"><label>Método de pago</label><select id="fiaPaymentMethod">${accountPaymentMethodOptions()}</select></div>
-      <button class="btn btn-primary btn-block" type="submit">Registrar abono</button>
-    </form>
-  `);
-  document.getElementById('fiaPaymentForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    try { await api.post('/api/fiados/' + id + '/pagos', { amount: Number(document.getElementById('fiaPaymentAmount').value), method: document.getElementById('fiaPaymentMethod').value }); closeModal(); toast('Abono registrado', 'success'); renderCreditDetail(id); } catch (err) { toast(err.message, 'error'); }
-  });
+async function openAccountPayment(type, id) {
+  try {
+    const account = await api.get(`/api/${type}/${id}`);
+    const isSeparated = type === 'separados';
+    const route = isSeparated ? 'separados' : 'fiados';
+    const itemOptions = account.items.map((item) => `
+      <option value="${item.id}" data-balance="${Math.max(Number(item.subtotal) - Number(item.allocated_amount || 0), 0)}">
+        ${escapeHtml(item.product_reference)}${item.size ? ' · talla ' + escapeHtml(item.size) : ''} · saldo sin asignar ${fmtMoney(Math.max(Number(item.subtotal) - Number(item.allocated_amount || 0), 0))}
+      </option>
+    `).join('');
+    showModal(`
+      <h3>Registrar abono</h3>
+      <p class="helper-text">Saldo de la cuenta: <strong>${fmtMoney(account.balance)}</strong></p>
+      <form id="accountPaymentForm">
+        <div class="field"><label>Aplicar abono a</label><select id="accountPaymentTarget"><option value="">Cuenta completa</option>${itemOptions}</select></div>
+        <div class="field"><label>Valor</label><input id="accountPaymentAmount" type="number" min="0.01" step="0.01" max="${account.balance}" required /></div>
+        <div id="accountPaymentLimit" class="helper-text" style="margin:-8px 0 14px">Máximo de la cuenta: ${fmtMoney(account.balance)}</div>
+        <div class="field"><label>Método de pago</label><select id="accountPaymentMethod">${accountPaymentMethodOptions()}</select></div>
+        <button class="btn btn-primary btn-block" type="submit">Registrar abono</button>
+      </form>
+    `);
+    const target = document.getElementById('accountPaymentTarget');
+    const amount = document.getElementById('accountPaymentAmount');
+    const limit = document.getElementById('accountPaymentLimit');
+    const updateLimit = () => {
+      const option = target.selectedOptions[0];
+      const max = option?.dataset.balance ? Math.min(Number(option.dataset.balance), Number(account.balance)) : Number(account.balance);
+      amount.max = String(max);
+      limit.textContent = `Máximo para ${target.value ? 'este producto' : 'la cuenta'}: ${fmtMoney(max)}`;
+    };
+    target.addEventListener('change', updateLimit);
+    updateLimit();
+    document.getElementById('accountPaymentForm').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const payload = {
+        amount: Number(amount.value),
+        method: document.getElementById('accountPaymentMethod').value,
+        ...(target.value ? { itemId: Number(target.value) } : {}),
+      };
+      try {
+        await api.post(`/api/${route}/${id}/pagos`, payload);
+        closeModal();
+        toast('Abono registrado', 'success');
+        if (isSeparated) await renderSeparatedDetail(id);
+        else await renderCreditDetail(id);
+      } catch (error) { toast(error.message, 'error'); }
+    });
+  } catch (error) { toast(error.message, 'error'); }
 }
 
 async function openAccountItemsModal(type, id) {
@@ -607,7 +633,10 @@ async function openAccountItemsModal(type, id) {
   showModal(`
     <h3>Agregar productos a la cuenta</h3>
     <form id="accountItemsForm">
-      <div class="field"><label>Producto</label><select id="accountItemVariant" required><option value="">Selecciona un producto</option>${entries.map(({ product, variant }) => `<option value="${variant.variant_id}">${escapeHtml(product.reference)}${variant.size ? ' · talla ' + escapeHtml(variant.size) : ''} · ${escapeHtml(product.name)} · ${variant.available_quantity} disp.</option>`).join('')}</select></div>
+      <div class="field"><label>Buscar en inventario</label><input id="accountItemSearch" type="search" placeholder="Referencia, nombre o talla" autocomplete="off" /></div>
+      <div id="accountItemResults" class="search-results" style="max-height:240px;overflow:auto;margin-bottom:14px"></div>
+      <div id="accountItemSelected" class="helper-text" style="margin-bottom:12px">Busca y selecciona un producto para agregarlo.</div>
+      <input id="accountItemVariant" type="hidden" />
       <div class="field"><label>Cantidad</label><input id="accountItemQuantity" type="number" min="1" step="1" value="1" required /></div>
       <div class="field"><label>Precio unitario</label><input id="accountItemPrice" type="number" min="0" step="1" required /></div>
       <button id="accountItemAdd" class="btn btn-outline btn-block" type="button">Agregar a la lista</button>
@@ -615,13 +644,34 @@ async function openAccountItemsModal(type, id) {
       <button class="btn btn-primary btn-block" type="submit">Guardar productos</button>
     </form>
   `);
-  const variantSelect = document.getElementById('accountItemVariant');
+  const searchInput = document.getElementById('accountItemSearch');
+  const results = document.getElementById('accountItemResults');
+  const selectedLabel = document.getElementById('accountItemSelected');
+  const variantInput = document.getElementById('accountItemVariant');
   const priceInput = document.getElementById('accountItemPrice');
   const list = document.getElementById('accountItemList');
-  variantSelect.addEventListener('change', () => {
-    const entry = entries.find(({ variant }) => Number(variant.variant_id) === Number(variantSelect.value));
-    if (entry) priceInput.value = String(entry.product.price);
-  });
+  let selectedEntry = null;
+  const renderMatches = (query = '') => {
+    const term = normalizeSearchValue(query);
+    const matches = entries.filter(({ product, variant }) => normalizeSearchValue(
+      `${product.reference} ${product.name} ${variant.size || ''}`
+    ).includes(term)).slice(0, 20);
+    results.innerHTML = matches.length ? matches.map(({ product, variant }) => `
+      <button type="button" class="btn btn-outline" style="display:block;width:100%;text-align:left;margin:6px 0;padding:10px 12px" data-account-variant="${variant.variant_id}">
+        <strong>${escapeHtml(product.reference)}</strong>${variant.size ? ' · talla ' + escapeHtml(variant.size) : ''}
+        <div class="meta">${escapeHtml(product.name)} · ${fmtMoney(product.price)} · ${variant.available_quantity} disponibles</div>
+      </button>
+    `).join('') : '<p class="helper-text">No hay productos que coincidan con la búsqueda.</p>';
+    results.querySelectorAll('[data-account-variant]').forEach((button) => button.addEventListener('click', () => {
+      selectedEntry = entries.find(({ variant }) => Number(variant.variant_id) === Number(button.dataset.accountVariant));
+      if (!selectedEntry) return;
+      variantInput.value = String(selectedEntry.variant.variant_id);
+      priceInput.value = String(selectedEntry.product.price);
+      selectedLabel.textContent = `Seleccionado: ${selectedEntry.product.reference}${selectedEntry.variant.size ? ' · talla ' + selectedEntry.variant.size : ''} · ${fmtMoney(selectedEntry.product.price)}`;
+    }));
+  };
+  searchInput.addEventListener('input', () => renderMatches(searchInput.value));
+  renderMatches();
   const renderItems = () => {
     list.innerHTML = selectedItems.length
       ? selectedItems.map((item, index) => `<div class="product-item" style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:8px 10px"><span>${escapeHtml(item.label)} · ${item.quantity} × ${fmtMoney(item.unitPrice)}</span><button type="button" class="btn btn-danger" data-remove-account-item="${index}">Quitar</button></div>`).join('')
@@ -633,19 +683,22 @@ async function openAccountItemsModal(type, id) {
   };
   renderItems();
   document.getElementById('accountItemAdd').addEventListener('click', () => {
-    const entry = entries.find(({ variant }) => Number(variant.variant_id) === Number(variantSelect.value));
     const quantity = Number(document.getElementById('accountItemQuantity').value);
     const unitPrice = Number(priceInput.value);
-    if (!entry) return toast('Selecciona un producto.', 'error');
+    if (!selectedEntry) return toast('Busca y selecciona un producto.', 'error');
     if (!Number.isInteger(quantity) || quantity <= 0 || !Number.isFinite(unitPrice) || unitPrice < 0) return toast('Revisa la cantidad y el precio.', 'error');
     selectedItems.push({
-      variantId: Number(entry.variant.variant_id),
+      variantId: Number(selectedEntry.variant.variant_id),
       quantity,
       unitPrice,
-      label: `${entry.product.reference}${entry.variant.size ? ' · talla ' + entry.variant.size : ''}`,
+      label: `${selectedEntry.product.reference}${selectedEntry.variant.size ? ' · talla ' + selectedEntry.variant.size : ''}`,
     });
     renderItems();
-    variantSelect.value = '';
+    selectedEntry = null;
+    variantInput.value = '';
+    selectedLabel.textContent = 'Producto agregado. Busca otro para continuar.';
+    searchInput.value = '';
+    renderMatches();
   });
   document.getElementById('accountItemsForm').addEventListener('submit', async (event) => {
     event.preventDefault();
@@ -674,32 +727,81 @@ function openSeparatedRetiro(id) {
   });
 }
 
-function openSeparatedCancel(id) {
-  showModal(`
-    <h3>Anular separado</h3>
-    <form id="sepCancelForm">
-      <div class="field"><label>Motivo</label><input id="sepCancelReason" required /></div>
-      <button class="btn btn-danger btn-block" type="submit">Confirmar anulación</button>
-    </form>
-  `);
-  document.getElementById('sepCancelForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    try { await api.post('/api/separados/' + id + '/anular', { reason: document.getElementById('sepCancelReason').value }); closeModal(); toast('Separado anulado', 'success'); renderSeparatedOrders(); } catch (err) { toast(err.message, 'error'); }
-  });
+async function openSeparatedReturn(id) {
+  try {
+    const order = await api.get('/api/separados/' + id);
+    const returnableItems = order.items.filter((item) => Number(item.retired_quantity) > 0);
+    if (!returnableItems.length) return toast('No hay productos retirados pendientes de devolución.', 'error');
+    showModal(`
+      <h3>Devolver producto al inventario</h3>
+      <form id="sepReturnForm">
+        <div class="field"><label>Producto</label><select id="sepReturnItem" required>${returnableItems.map((item) => `<option value="${item.id}" data-max="${item.retired_quantity}">${escapeHtml(item.product_reference)}${item.size ? ' · talla ' + escapeHtml(item.size) : ''} · ${escapeHtml(item.product_name)} · retiradas: ${item.retired_quantity}</option>`).join('')}</select></div>
+        <div class="field"><label>Cantidad devuelta</label><input id="sepReturnQuantity" type="number" min="1" step="1" required /></div>
+        <button class="btn btn-primary btn-block" type="submit">Registrar devolución física</button>
+      </form>
+    `);
+    const itemSelect = document.getElementById('sepReturnItem');
+    const quantityInput = document.getElementById('sepReturnQuantity');
+    const updateMax = () => {
+      const max = Number(itemSelect.selectedOptions[0]?.dataset.max || 0);
+      quantityInput.max = String(max);
+      quantityInput.value = String(max > 0 ? 1 : 0);
+    };
+    itemSelect.addEventListener('change', updateMax);
+    updateMax();
+    document.getElementById('sepReturnForm').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      try {
+        await api.post(`/api/separados/${id}/devolucion`, { itemId: Number(itemSelect.value), quantity: Number(quantityInput.value) });
+        closeModal();
+        toast('Inventario actualizado con la devolución', 'success');
+        await renderSeparatedDetail(id);
+      } catch (error) { toast(error.message, 'error'); }
+    });
+  } catch (error) { toast(error.message, 'error'); }
 }
 
-function openFiadoCancel(id) {
-  showModal(`
-    <h3>Anular fiado</h3>
-    <form id="fiaCancelForm">
-      <div class="field"><label>Motivo</label><input id="fiaCancelReason" required /></div>
-      <button class="btn btn-danger btn-block" type="submit">Confirmar anulación</button>
-    </form>
-  `);
-  document.getElementById('fiaCancelForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    try { await api.post('/api/fiados/' + id + '/anular', { reason: document.getElementById('fiaCancelReason').value }); closeModal(); toast('Fiado anulado', 'success'); renderCreditSales(); } catch (err) { toast(err.message, 'error'); }
-  });
+function openSeparatedCancel(id) { openAccountCancellation('separados', id); }
+function openFiadoCancel(id) { openAccountCancellation('fiados', id); }
+
+async function openAccountCancellation(type, id) {
+  try {
+    const account = await api.get(`/api/${type}/${id}`);
+    const isSeparated = type === 'separados';
+    const withdrawn = isSeparated ? account.items.reduce((sum, item) => sum + Number(item.retired_quantity || 0), 0) : 0;
+    const paidAmount = Number(account.paid_amount || 0);
+    const refundField = paidAmount > 0 ? `
+      <div class="field"><label>Devolver ${fmtMoney(paidAmount)} por</label><select id="accountRefundMethod" required>${accountPaymentMethodOptions()}</select></div>
+    ` : '';
+    const physicalReturnField = !isSeparated ? '<div class="field"><label><input id="accountItemsReturned" type="checkbox" required style="width:auto;margin-right:8px" />Confirmo que recibí físicamente todos los productos</label></div>' : '';
+    showModal(`
+      <h3>Anular ${isSeparated ? 'separado' : 'fiado'}</h3>
+      <p class="helper-text">${isSeparated && withdrawn > 0
+        ? `Hay ${withdrawn} producto(s) retirado(s). Registra primero la devolución física para anular la cuenta.`
+        : paidAmount > 0
+          ? `La anulación devolverá el total abonado (${fmtMoney(paidAmount)}) y quedará registrada en caja.`
+          : 'Esta acción cancelará la cuenta y actualizará el inventario.'}</p>
+      <form id="accountCancelForm">
+        <div class="field"><label>Motivo</label><input id="accountCancelReason" required /></div>
+        ${refundField}
+        ${physicalReturnField}
+        <button class="btn btn-danger btn-block" type="submit" ${withdrawn > 0 ? 'disabled' : ''}>Confirmar anulación</button>
+      </form>
+    `);
+    document.getElementById('accountCancelForm').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const payload = { reason: document.getElementById('accountCancelReason').value.trim() };
+      if (paidAmount > 0) payload.refundMethod = document.getElementById('accountRefundMethod').value;
+      if (!isSeparated) payload.itemsReturned = document.getElementById('accountItemsReturned').checked;
+      try {
+        const result = await api.post(`/api/${type}/${id}/anular`, payload);
+        closeModal();
+        toast(result.refundedAmount > 0 ? `Cuenta anulada · devolución ${fmtMoney(result.refundedAmount)} registrada` : 'Cuenta anulada', 'success');
+        if (isSeparated) await renderSeparatedOrders();
+        else await renderCreditSales();
+      } catch (error) { toast(error.message, 'error'); }
+    });
+  } catch (error) { toast(error.message, 'error'); }
 }
 
 // ---------------- INVENTORY LIST ----------------
@@ -1587,7 +1689,7 @@ async function loadReportBody() {
         <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;${i > 0 ? 'border-top:1px solid var(--line)' : ''}">
           <div>
             <div style="font-weight:700">${escapeHtml(paymentLabel(p.method, p.destination))}</div>
-            <div class="meta">${p.transactionCount} ${p.transactionCount === 1 ? 'operación' : 'operaciones'}</div>
+            <div class="meta">${p.transactionCount} ${p.transactionCount === 1 ? 'ingreso' : 'ingresos'}${p.refundTotal > 0 ? ` · Devoluciones: ${fmtMoney(p.refundTotal)}` : ''}</div>
           </div>
           <div style="font-weight:700">${fmtMoney(p.total)}</div>
         </div>
@@ -1639,12 +1741,19 @@ async function loadReportBody() {
 
 function barChartSvg(timeline) {
   const width = 320, height = 140, padding = 24;
-  const max = Math.max(...timeline.map((t) => t.total), 1);
+  const totals = timeline.map((entry) => Number(entry.total));
+  const min = Math.min(...totals, 0);
+  const max = Math.max(...totals, 0);
+  const valueRange = max - min || 1;
+  const chartHeight = height - padding - 14;
+  const baseline = padding + (max / valueRange) * chartHeight;
+  const scale = chartHeight / valueRange;
   const barWidth = (width - padding) / timeline.length;
   const bars = timeline.map((t, i) => {
-    const barHeight = (t.total / max) * (height - padding - 10);
+    const value = Number(t.total);
+    const barHeight = Math.abs(value) * scale;
     const x = padding + i * barWidth;
-    const y = height - padding - barHeight;
+    const y = value >= 0 ? baseline - barHeight : baseline;
     const dateParts = String(t.period).slice(0, 10).split('-');
     const label = dateParts.length === 3 ? `${dateParts[2]}/${dateParts[1]}` : '';
     return `
@@ -1654,7 +1763,7 @@ function barChartSvg(timeline) {
   }).join('');
   return `
     <svg viewBox="0 0 ${width} ${height}" style="width:100%;height:auto" xmlns="http://www.w3.org/2000/svg">
-      <line x1="${padding}" y1="${height - padding}" x2="${width}" y2="${height - padding}" stroke="#ead9df" />
+      <line x1="${padding}" y1="${baseline}" x2="${width}" y2="${baseline}" stroke="#ead9df" />
       ${bars}
     </svg>
   `;

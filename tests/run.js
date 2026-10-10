@@ -108,12 +108,12 @@ async function testReportsIncludeAccountPayments() {
     if (sql.includes("FROM sales WHERE status = 'completada'")) return { rows: [{ total: '100', count: 2 }] };
     if (sql.includes('FROM sale_items si')) return { rows: [{ qty: 4 }] };
     if (sql.includes("status = 'anulada'")) return { rows: [{ count: 1, total: '20' }] };
-    if (sql.includes('FROM separated_payments') && sql.includes('UNION ALL')) return { rows: [{ count: 3, total: '90' }] };
+    if (sql.includes('FROM separated_payments') && sql.includes('UNION ALL')) return { rows: [{ count: 3, total: '70', refund_total: '20' }] };
     throw new Error(`Consulta inesperada en prueba de reportes: ${sql}`);
   };
   try {
     const totals = await reports.totals('2026-10-01', '2026-10-01');
-    assert(totals.revenue === 190 && totals.directSalesRevenue === 100 && totals.paymentRevenue === 90, 'Ingresos incluyen ventas directas y pagos de fiados/separados sin duplicar ventas');
+    assert(totals.revenue === 170 && totals.directSalesRevenue === 100 && totals.paymentRevenue === 70 && totals.refundTotal === 20, 'Ingresos incluyen pagos netos de devoluciones sin duplicar ni descontar dos veces');
     assert(totals.saleCount === 2 && totals.paymentCount === 3 && totals.avgTicket === 50 && totals.itemsSold === 4, 'Métricas de ventas directas siguen separadas del número de abonos');
     const summary = await reports.paymentSummary('2026-10-01', '2026-10-01');
     assert(summary[0].transactionCount === 4 && summary[0].total === 120, 'Resumen por método agrega operaciones de pago');
@@ -375,6 +375,15 @@ async function run() {
 
   r = await req('POST', `/api/separados/${separatedId}/anular`, { reason: 'Prueba de liberación' });
   assert(r.status === 400, 'No permite anular un separado con retiros ya registrados');
+  r = await req('GET', `/api/separados/${separatedId}`);
+  const returnedItem = r.data.items.find((item) => Number(item.retired_quantity) > 0);
+  const stockBeforePhysicalReturn = (await req('GET', `/api/products/${separatedProduct.id}`)).data.variants[0].quantity;
+  r = await req('POST', `/api/separados/${separatedId}/devolucion`, { itemId: returnedItem.id, quantity: 1 });
+  assert(r.status === 200 && r.data.remainingWithdrawn === 0, 'Devolver mercancía retirada restaura el estado del artículo');
+  r = await req('GET', `/api/products/${separatedProduct.id}`);
+  assert(r.data.variants[0].quantity === stockBeforePhysicalReturn + 1, 'La devolución física repone exactamente una unidad al inventario');
+  r = await req('POST', `/api/separados/${separatedId}/anular`, { reason: 'Anulación después de devolución física' });
+  assert(r.status === 200, 'El separado puede anularse tras devolver físicamente sus productos');
 
   r = await req('POST', '/api/separados', {
     clientName: 'Pedro',
@@ -413,6 +422,12 @@ async function run() {
   assert(r.status === 200 && r.data.items.length === 2 && r.data.payments.some((payment) => payment.payment_method === 'daviplata') && r.data.payments.some((payment) => payment.payment_method === 'nequi'), 'El detalle conserva productos y canales de pago de la cuenta ampliada');
   const separatedIncomeAfter = (await req('GET', `/api/reports/overview?from=${reportDay}&to=${reportDay}`)).data;
   assert(separatedIncomeAfter.revenue - separatedIncomeBefore.revenue === 30000 && separatedIncomeAfter.paymentCount - separatedIncomeBefore.paymentCount === 2, 'Los ingresos diarios reflejan solo los abonos recibidos en separados');
+  r = await req('POST', `/api/separados/${expandableSeparatedId}/anular`, { reason: 'Reembolso prueba' });
+  assert(r.status === 400, 'Anular un separado con abonos exige registrar método de devolución');
+  r = await req('POST', `/api/separados/${expandableSeparatedId}/anular`, { reason: 'Reembolso prueba', refundMethod: 'daviplata' });
+  assert(r.status === 200 && r.data.refundedAmount === 30000, 'Anular un separado devuelve y audita el total abonado');
+  const separatedIncomeAfterRefund = (await req('GET', `/api/reports/overview?from=${reportDay}&to=${reportDay}`)).data;
+  assert(separatedIncomeAfterRefund.revenue === separatedIncomeBefore.revenue && separatedIncomeAfterRefund.refundTotal - separatedIncomeBefore.refundTotal === 30000, 'El reembolso de separado revierte el ingreso neto sin borrar el historial');
 
   console.log('--- FIADOS ---');
   const creditIncomeBefore = (await req('GET', `/api/reports/overview?from=${reportDay}&to=${reportDay}`)).data;
@@ -444,33 +459,42 @@ async function run() {
   assert(r.status === 200 && r.data.total === 320000, 'Agregar productos amplía la deuda en el mismo fiado existente');
   r = await req('GET', `/api/fiados/${creditId}`);
   assert(r.status === 200 && r.data.items.length === 2 && r.data.paid_amount === 10000 && r.data.balance === 310000, 'La cuenta ampliada conserva el abono y recalcula el saldo');
+  const targetCreditItem = r.data.items.find((item) => item.product_reference === TEST_PRODUCT_REFERENCE);
   const priceStockAfterCreditAdd = (await req('GET', `/api/products/${priceProduct.id}`)).data.variants[0].quantity;
   assert(priceStockAfterCreditAdd === priceStockBeforeCreditAdd - 1, 'Agregar al fiado descuenta el inventario del nuevo producto');
 
-  r = await req('POST', `/api/fiados/${creditId}/pagos`, { amount: 50000, method: 'addi' });
+  r = await req('POST', `/api/fiados/${creditId}/pagos`, { amount: 50000, method: 'addi', itemId: targetCreditItem.id });
   assert(r.status === 200, 'Registrar abono del fiado funciona');
   r = await req('GET', `/api/fiados/${creditId}`);
-  assert(r.data.payments.some((payment) => payment.payment_method === 'qr') && r.data.payments.some((payment) => payment.payment_method === 'addi'), 'El historial del fiado identifica el método de cada ingreso');
+  assert(r.data.payments.some((payment) => payment.payment_method === 'qr') && r.data.payments.some((payment) => payment.payment_method === 'addi' && payment.allocated_item_id === targetCreditItem.id), 'El historial conserva método y producto al que se asignó el abono');
   const creditIncomeAfter = (await req('GET', `/api/reports/overview?from=${reportDay}&to=${reportDay}`)).data;
   assert(creditIncomeAfter.revenue - creditIncomeBefore.revenue === 60000 && creditIncomeAfter.paymentCount - creditIncomeBefore.paymentCount === 2, 'Los abonos inicial y posterior del fiado se reflejan como ingresos diarios');
   r = await req('GET', '/api/dashboard');
   assert(r.status === 200 && r.data.incomeToday === creditIncomeAfter.revenue, 'Dashboard y reporte coinciden en ingresos del día');
 
-  r = await req('POST', `/api/fiados/${creditId}/anular`, { reason: 'Prueba de devolución' });
-  assert(r.status === 400, 'No permite anular un fiado con pagos registrados');
+  r = await req('POST', `/api/fiados/${creditId}/anular`, { reason: 'Prueba de devolución', itemsReturned: true });
+  assert(r.status === 400, 'Anular un fiado con pagos exige método de devolución');
+  r = await req('POST', `/api/fiados/${creditId}/anular`, { reason: 'Prueba de devolución', refundMethod: 'transferencia', itemsReturned: true });
+  assert(r.status === 200 && r.data.refundedAmount === 60000, 'Anular el fiado reembolsa y registra todos los abonos recibidos');
   r = await req('GET', '/api/products/' + productWithSizes.id);
   const stockAfterCreditVoid = r.data.variants.find((v) => v.size === '35').quantity;
-  assert(stockAfterCreditVoid === stockAfterCredit, 'El fiado pagado parcialmente conserva su inventario hasta conciliar la deuda');
+  assert(stockAfterCreditVoid === stockAfterCredit + 1, 'Anular un fiado devuelve sus productos al inventario');
+  r = await req('GET', `/api/products/${priceProduct.id}`);
+  assert(r.data.variants[0].quantity === priceStockAfterCreditAdd + 1, 'La anulación devuelve también productos anexados posteriormente');
+  const creditIncomeAfterRefund = (await req('GET', `/api/reports/overview?from=${reportDay}&to=${reportDay}`)).data;
+  assert(creditIncomeAfterRefund.revenue === creditIncomeBefore.revenue && creditIncomeAfterRefund.refundTotal - creditIncomeBefore.refundTotal === 60000, 'El reembolso del fiado ajusta una vez el ingreso neto diario');
 
   r = await req('POST', '/api/fiados', {
     clientName: 'Fiado sin abono', phone: '3117778899',
     items: [{ variantId: variant35.variant_id, quantity: 1, unitPrice: 150000 }],
   });
   const unpaidCreditId = r.data.creditId;
-  r = await req('POST', `/api/fiados/${unpaidCreditId}/anular`, { reason: 'Prueba de devolución sin pago' });
+  r = await req('POST', '/api/fiados/' + unpaidCreditId + '/anular', { reason: 'Prueba de devolución sin pago', itemsReturned: false });
+  assert(r.status === 400, 'La anulación de fiado exige confirmar devolución física');
+  r = await req('POST', '/api/fiados/' + unpaidCreditId + '/anular', { reason: 'Prueba de devolución sin pago', itemsReturned: true });
   assert(r.status === 200, 'Anular fiado sin pagos devuelve sus productos al inventario');
   r = await req('GET', '/api/products/' + productWithSizes.id);
-  assert(r.data.variants.find((v) => v.size === '35').quantity === stockAfterCredit, 'La anulación limpia restaura exactamente el inventario');
+  assert(r.data.variants.find((v) => v.size === '35').quantity === stockBeforeCredit, 'La anulación limpia restaura exactamente el inventario');
 
   r = await req('GET', '/api/fiados');
   assert(r.status === 200 && Array.isArray(r.data), 'Lista fiados responde correctamente');
