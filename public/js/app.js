@@ -1645,6 +1645,8 @@ init();
 
 // ---------------- REPORTS ----------------
 let reportRange = { from: null, to: null, preset: '30d' };
+let reportTab = 'resumen';
+let reportRequestId = 0;
 
 function computePresetRange(preset) {
   const today = new Date();
@@ -1666,18 +1668,39 @@ function computePresetRange(preset) {
 
 async function renderReports() {
   if (!reportRange.from) Object.assign(reportRange, computePresetRange('30d'));
+  const { from, to } = reportRange;
   view.innerHTML = `
     ${backLink('dashboard', 'Inicio')}
-    <h2 class="section-title">Informes y reportes</h2>
-    <div class="tab-row">
-      <button class="tab-btn ${reportRange.preset === 'today' ? 'active' : ''}" onclick="setReportPreset('today')">Hoy</button>
-      <button class="tab-btn ${reportRange.preset === '7d' ? 'active' : ''}" onclick="setReportPreset('7d')">Últimos 7 días</button>
-      <button class="tab-btn ${reportRange.preset === '30d' ? 'active' : ''}" onclick="setReportPreset('30d')">Últimos 30 días</button>
-      <button class="tab-btn ${reportRange.preset === 'month' ? 'active' : ''}" onclick="setReportPreset('month')">Este mes</button>
+    <div class="report-heading">
+      <div><span class="eyebrow">LECTURA DEL NEGOCIO</span><h2 class="section-title">Informes</h2></div>
+      <div class="report-period-summary"><span>Período seleccionado</span><strong>${escapeHtml(formatReportDate(from))} – ${escapeHtml(formatReportDate(to))}</strong></div>
+    </div>
+    <div class="report-controls">
+      <div class="report-period-controls">
+        <span class="eyebrow">PERÍODO</span>
+        <div class="tab-row" role="group" aria-label="Seleccionar período del informe">
+          <button class="tab-btn ${reportRange.preset === 'today' ? 'active' : ''}" onclick="setReportPreset('today')">Hoy</button>
+          <button class="tab-btn ${reportRange.preset === '7d' ? 'active' : ''}" onclick="setReportPreset('7d')">7 días</button>
+          <button class="tab-btn ${reportRange.preset === '30d' ? 'active' : ''}" onclick="setReportPreset('30d')">30 días</button>
+          <button class="tab-btn ${reportRange.preset === 'month' ? 'active' : ''}" onclick="setReportPreset('month')">Este mes</button>
+        </div>
+      </div>
+      <div class="report-view-tabs" role="tablist" aria-label="Secciones de informes">
+        <button class="report-view-tab ${reportTab === 'resumen' ? 'active' : ''}" role="tab" aria-selected="${reportTab === 'resumen'}" onclick="setReportTab('resumen')">Resumen</button>
+        <button class="report-view-tab ${reportTab === 'ventas' ? 'active' : ''}" role="tab" aria-selected="${reportTab === 'ventas'}" onclick="setReportTab('ventas')">Ventas y dinero</button>
+        <button class="report-view-tab ${reportTab === 'cuentas' ? 'active' : ''}" role="tab" aria-selected="${reportTab === 'cuentas'}" onclick="setReportTab('cuentas')">Fiados y separados</button>
+        <button class="report-view-tab ${reportTab === 'inventario' ? 'active' : ''}" role="tab" aria-selected="${reportTab === 'inventario'}" onclick="setReportTab('inventario')">Inventario</button>
+      </div>
     </div>
     <div id="reportBody" class="loading">Cargando…</div>
   `;
   await loadReportBody();
+}
+
+function formatReportDate(day) {
+  return new Intl.DateTimeFormat('es-CO', {
+    timeZone: 'America/Bogota', day: 'numeric', month: 'short', year: 'numeric',
+  }).format(new Date(`${day}T12:00:00-05:00`));
 }
 
 function setReportPreset(preset) {
@@ -1685,127 +1708,157 @@ function setReportPreset(preset) {
   renderReports();
 }
 
+function setReportTab(tab) {
+  reportTab = tab;
+  document.querySelectorAll('.report-view-tab').forEach((button) => {
+    const active = button.getAttribute('onclick') === `setReportTab('${tab}')`;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-selected', String(active));
+  });
+  loadReportBody();
+}
+
 async function loadReportBody() {
   const { from, to } = reportRange;
   const renderToken = navigationToken;
+  const requestId = ++reportRequestId;
   const qs = `?from=${from}&to=${to}`;
-  let overview; let timeline; let topProducts; let byCategory; let paymentSummary; let movements;
+  const requests = { overview: api.get('/api/reports/overview' + qs) };
+  if (reportTab === 'resumen' || reportTab === 'ventas') {
+    requests.timeline = api.get('/api/reports/sales-timeline' + qs + '&groupBy=day');
+  }
+  if (reportTab === 'ventas') requests.paymentSummary = api.get('/api/reports/payment-summary' + qs);
+  if (reportTab === 'inventario') {
+    requests.topProducts = api.get('/api/reports/top-products' + qs + '&limit=8');
+    requests.byCategory = api.get('/api/reports/by-category' + qs);
+    requests.movements = api.get('/api/reports/movements' + qs);
+  }
+  let reportData;
   try {
-    [overview, timeline, topProducts, byCategory, paymentSummary, movements] = await Promise.all([
-      api.get('/api/reports/overview' + qs),
-      api.get('/api/reports/sales-timeline' + qs + '&groupBy=day'),
-      api.get('/api/reports/top-products' + qs + '&limit=8'),
-      api.get('/api/reports/by-category' + qs),
-      api.get('/api/reports/payment-summary' + qs),
-      api.get('/api/reports/movements' + qs),
-    ]);
+    const entries = await Promise.all(Object.entries(requests).map(async ([key, request]) => [key, await request]));
+    reportData = Object.fromEntries(entries);
   } catch (error) {
     const failedContainer = document.getElementById('reportBody');
-    if (failedContainer && renderToken === navigationToken && from === reportRange.from && to === reportRange.to) {
+    if (failedContainer && requestId === reportRequestId && renderToken === navigationToken && from === reportRange.from && to === reportRange.to) {
       failedContainer.innerHTML = '<div class="empty-state"><p>No se pudieron cargar los informes.</p><button class="btn btn-outline" onclick="loadReportBody()">Reintentar</button></div>';
     }
     return;
   }
 
   const container = document.getElementById('reportBody');
-  if (!container || renderToken !== navigationToken || from !== reportRange.from || to !== reportRange.to) return;
-  const creditActivity = overview.accountActivity?.fiados || {};
-  const separatedActivity = overview.accountActivity?.separados || {};
-  const accountActivityRows = [
-    { label: 'Fiados', activity: creditActivity },
-    { label: 'Separados', activity: separatedActivity },
+  if (!container || requestId !== reportRequestId || renderToken !== navigationToken || from !== reportRange.from || to !== reportRange.to) return;
+  const { overview, timeline = [], topProducts = [], byCategory = [], paymentSummary = [], movements = [] } = reportData;
+  const reportViews = {
+    resumen: () => renderReportSummary(overview, timeline),
+    ventas: () => renderSalesMoneyReport(overview, timeline, paymentSummary),
+    cuentas: () => renderAccountsReport(overview.accountActivity),
+    inventario: () => renderInventoryReport(overview, topProducts, byCategory, movements),
+  };
+  container.innerHTML = (reportViews[reportTab] || reportViews.resumen)();
+}
+
+function reportStat(label, value, detail = '', featured = false) {
+  return `<div class="card stat-card ${featured ? 'stat-card-featured' : ''}"><div class="label">${label}</div><div class="value">${value}</div>${detail ? `<div class="stat-detail">${detail}</div>` : ''}</div>`;
+}
+
+function renderReportSummary(overview, timeline) {
+  const openBalance = Number(overview.accountActivity?.fiados?.openBalance || 0)
+    + Number(overview.accountActivity?.separados?.openBalance || 0);
+  return `
+    <div class="report-view-intro"><h3>Resumen del período</h3><p>Dinero recibido, ventas realizadas y cuentas pendientes, en un solo vistazo.</p></div>
+    <div class="stat-grid report-kpi-grid">
+      ${reportStat('Dinero neto recibido', fmtMoney(overview.revenue), 'Ventas + abonos − devoluciones', true)}
+      ${reportStat('Ventas de mostrador', fmtMoney(overview.directSalesRevenue), `${overview.saleCount} ${overview.saleCount === 1 ? 'venta' : 'ventas'}`)}
+      ${reportStat('Abonos netos', fmtMoney(overview.paymentRevenue), `${overview.paymentCount} ${overview.paymentCount === 1 ? 'abono' : 'abonos'} · después de devoluciones`)}
+      ${reportStat('Pendiente por cobrar', fmtMoney(openBalance), 'Saldo actual de fiados y separados')}
+    </div>
+    <section class="report-panel">
+      <div class="report-panel-heading"><div><h3>Dinero recibido cada día</h3><p>Incluye ventas y abonos; descuenta devoluciones.</p></div></div>
+      ${timeline.length ? barChartSvg(timeline) : '<p class="report-empty">No hay movimientos de dinero en estas fechas.</p>'}
+    </section>
+  `;
+}
+
+function renderSalesMoneyReport(overview, timeline, paymentSummary) {
+  return `
+    <div class="report-view-intro"><h3>Ventas y dinero</h3><p>Las ventas de mostrador y los abonos se muestran por separado para no contar el dinero dos veces.</p></div>
+    <div class="stat-grid report-kpi-grid">
+      ${reportStat('Ventas de mostrador', overview.saleCount, fmtMoney(overview.directSalesRevenue), true)}
+      ${reportStat('Artículos vendidos', overview.itemsSold)}
+      ${reportStat('Valor promedio por venta', fmtMoney(overview.avgTicket))}
+      ${reportStat('Ventas anuladas', overview.voidedCount, overview.voidedCount ? `Valor: ${fmtMoney(overview.voidedTotal)}` : 'Ninguna en este período')}
+    </div>
+    <div class="report-two-column">
+      <section class="report-panel">
+        <div class="report-panel-heading"><div><h3>Dinero por forma de pago</h3><p>El valor ya descuenta las devoluciones.</p></div></div>
+        ${paymentSummary.length ? `<div class="report-breakdown">${paymentSummary.map((payment) => `
+          <div class="report-breakdown-row">
+            <div><strong>${escapeHtml(paymentLabel(payment.method, payment.destination))}</strong><span>${payment.transactionCount} ${payment.transactionCount === 1 ? 'ingreso' : 'ingresos'}${payment.refundTotal > 0 ? ` · Devuelto ${fmtMoney(payment.refundTotal)}` : ''}</span></div>
+            <strong class="report-number">${fmtMoney(payment.total)}</strong>
+          </div>
+        `).join('')}</div>` : '<p class="report-empty">No hay ingresos en este período.</p>'}
+      </section>
+      <section class="report-panel">
+        <div class="report-panel-heading"><div><h3>Dinero recibido cada día</h3><p>Ventas, abonos y devoluciones.</p></div></div>
+        ${timeline.length ? barChartSvg(timeline) : '<p class="report-empty">No hay movimientos de dinero en estas fechas.</p>'}
+      </section>
+    </div>
+  `;
+}
+
+function renderAccountsReport(accountActivity = {}) {
+  const definitions = [
+    { key: 'fiados', label: 'Fiados', index: '01' },
+    { key: 'separados', label: 'Separados', index: '02' },
   ];
-  container.innerHTML = `
-    <div class="stat-grid">
-      <div class="card stat-card"><div class="label">Ingresos</div><div class="value">${fmtMoney(overview.revenue)}</div></div>
-      <div class="card stat-card"><div class="label">Ventas</div><div class="value">${overview.saleCount}</div></div>
-      <div class="card stat-card"><div class="label">Productos vendidos</div><div class="value">${overview.itemsSold}</div></div>
-      <div class="card stat-card"><div class="label">Ticket promedio</div><div class="value">${fmtMoney(overview.avgTicket)}</div></div>
-      <div class="card stat-card ${overview.voidedCount > 0 ? 'alert' : ''}"><div class="label">Ventas anuladas</div><div class="value">${overview.voidedCount}</div></div>
-      <div class="card stat-card"><div class="label">Valor del inventario</div><div class="value">${fmtMoney(overview.inventoryValue)}</div></div>
-    </div>
-
-    <h3>Informe de fiados y separados</h3>
-    <div class="card" style="margin-bottom:24px;overflow-x:auto">
-      <table style="width:100%;min-width:900px;border-collapse:collapse;text-align:right">
-        <thead><tr style="border-bottom:1px solid var(--line)">
-          <th style="padding:10px;text-align:left">Tipo</th>
-          <th style="padding:10px">Cuentas creadas</th>
-          <th style="padding:10px">Unidades agregadas</th>
-          <th style="padding:10px">Valor de productos</th>
-          <th style="padding:10px">Abonos del período</th>
-          <th style="padding:10px">Devoluciones</th>
-          <th style="padding:10px">Recaudo neto</th>
-          <th style="padding:10px">Saldo abierto actual</th>
-        </tr></thead>
-        <tbody>${accountActivityRows.map(({ label, activity }) => `
-          <tr style="border-bottom:1px solid var(--line)">
-            <th scope="row" style="padding:12px 10px;text-align:left">${label}</th>
-            <td style="padding:12px 10px">${activity.accountsCreated || 0}</td>
-            <td style="padding:12px 10px">${activity.unitsAdded || 0} <span class="meta">(${activity.productLines || 0} líneas)</span></td>
-            <td style="padding:12px 10px">${fmtMoney(activity.productsValue || 0)}</td>
-            <td style="padding:12px 10px">${fmtMoney(activity.paymentsReceived || 0)} <span class="meta">(${activity.paymentCount || 0})</span></td>
-            <td style="padding:12px 10px">${fmtMoney(activity.refundsIssued || 0)}</td>
-            <td style="padding:12px 10px;font-weight:700">${fmtMoney(activity.netCollected || 0)}</td>
-            <td style="padding:12px 10px;font-weight:700">${fmtMoney(activity.openBalance || 0)}</td>
-          </tr>
-        `).join('')}</tbody>
-      </table>
-      <p class="helper-text" style="margin:12px 10px 0">La actividad y los abonos corresponden al período seleccionado; el saldo abierto es el actual de todas las cuentas vigentes.</p>
-    </div>
-
-    <h3>¿Cómo entró el dinero?</h3>
-    <div class="card" style="margin-bottom:24px">
-      ${paymentSummary.length === 0 ? '<p class="helper-text">Sin ventas en este período.</p>' : paymentSummary.map((p, i) => `
-        <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;${i > 0 ? 'border-top:1px solid var(--line)' : ''}">
-          <div>
-            <div style="font-weight:700">${escapeHtml(paymentLabel(p.method, p.destination))}</div>
-            <div class="meta">${p.transactionCount} ${p.transactionCount === 1 ? 'ingreso' : 'ingresos'}${p.refundTotal > 0 ? ` · Devoluciones: ${fmtMoney(p.refundTotal)}` : ''}</div>
+  return `
+    <div class="report-view-intro"><h3>Fiados y separados</h3><p>Compara lo añadido y cobrado en las fechas elegidas con lo que todavía está pendiente.</p></div>
+    <div class="report-account-list">${definitions.map(({ key, label, index }) => {
+      const activity = accountActivity[key] || {};
+      return `
+        <section class="report-account-panel">
+          <div class="report-account-title"><span>${index}</span><h3>${label}</h3></div>
+          <div class="report-account-metrics">
+            <div><span>Cuentas nuevas</span><strong>${activity.accountsCreated || 0}</strong></div>
+            <div><span>Unidades añadidas en el período</span><strong>${activity.unitsAdded || 0}</strong><small>${activity.productLines || 0} referencias</small></div>
+            <div><span>Valor de productos del período</span><strong>${fmtMoney(activity.productsValue || 0)}</strong></div>
+            <div><span>Abonos recibidos en el período</span><strong>${fmtMoney(activity.paymentsReceived || 0)}</strong><small>${activity.paymentCount || 0} movimientos</small></div>
+            <div><span>Devoluciones del período</span><strong>${fmtMoney(activity.refundsIssued || 0)}</strong></div>
+            <div><span>Recaudo neto del período</span><strong>${fmtMoney(activity.netCollected || 0)}</strong></div>
+            <div class="report-account-balance"><span>Pendiente actual, todas las cuentas</span><strong>${fmtMoney(activity.openBalance || 0)}</strong></div>
           </div>
-          <div style="font-weight:700">${fmtMoney(p.total)}</div>
-        </div>
-      `).join('')}
-    </div>
+        </section>
+      `;
+    }).join('')}</div>
+    <p class="report-footnote">Las unidades y cuentas corresponden al período seleccionado. El pendiente refleja todas las cuentas vigentes a la fecha de hoy.</p>
+  `;
+}
 
-    <h3>Ingresos por día</h3>
-    <div class="card" style="margin-bottom:24px">
-      ${timeline.length === 0 ? '<p class="helper-text">No hay ingresos en este período.</p>' : barChartSvg(timeline)}
+function renderInventoryReport(overview, topProducts, byCategory, movements) {
+  return `
+    <div class="report-view-intro"><h3>Inventario</h3><p>Consulta las ventas de mostrador, los productos que más se mueven y el stock disponible actualmente.</p></div>
+    <div class="stat-grid report-kpi-grid">
+      ${reportStat('Unidades en inventario', overview.inventoryUnits)}
+      ${reportStat('Valor actual', fmtMoney(overview.inventoryValue), 'A precio de venta', true)}
+      ${reportStat('Artículos vendidos en mostrador', overview.itemsSold)}
     </div>
-
-    <h3>Productos más vendidos</h3>
-    <div class="card" style="margin-bottom:24px">
-      ${topProducts.length === 0 ? '<p class="helper-text">Sin datos en este período.</p>' : topProducts.map((p, i) => `
-        <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;${i > 0 ? 'border-top:1px solid var(--line)' : ''}">
-          <div>
-            <div style="font-weight:700">${escapeHtml(p.name)}</div>
-            <div class="meta">${escapeHtml(p.reference)}</div>
-          </div>
-          <div style="text-align:right">
-            <div style="font-weight:700">${p.unitsSold} und.</div>
-            <div class="meta">${fmtMoney(p.revenue)}</div>
-          </div>
-        </div>
-      `).join('')}
-    </div>
-
-    <h3>Ventas por categoría</h3>
-    <div class="card" style="margin-bottom:24px">
-      ${byCategory.length === 0 ? '<p class="helper-text">Sin datos en este período.</p>' : byCategory.map((c, i) => `
-        <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;${i > 0 ? 'border-top:1px solid var(--line)' : ''}">
-          <div style="font-weight:700">${escapeHtml(c.category)}</div>
-          <div style="text-align:right">
-            <div style="font-weight:700">${fmtMoney(c.revenue)}</div>
-            <div class="meta">${c.unitsSold} unidades</div>
-          </div>
-        </div>
-      `).join('')}
-    </div>
-
-    <h3>Movimientos de inventario</h3>
-    <div class="card">
-      ${movements.length === 0 ? '<p class="helper-text">Sin movimientos en este período.</p>' : movements.map((m) => `
-        <div class="size-chip" style="margin:4px">${capitalize(m.type)}: ${m.movementCount} (${m.netChange > 0 ? '+' : ''}${m.netChange} unidades)</div>
-      `).join('')}
+    <div class="report-two-column">
+      <section class="report-panel">
+        <div class="report-panel-heading"><div><h3>Más vendidos en mostrador</h3><p>Ordenados por unidades vendidas en el período.</p></div></div>
+        ${topProducts.length ? `<div class="report-ranking">${topProducts.map((product, index) => `
+          <div class="report-ranking-row"><span class="report-rank">${String(index + 1).padStart(2, '0')}</span><div><strong>${escapeHtml(product.name)}</strong><span>${escapeHtml(product.reference)}</span></div><div class="report-ranking-total"><strong>${product.unitsSold}</strong><span>und. · ${fmtMoney(product.revenue)}</span></div></div>
+        `).join('')}</div>` : '<p class="report-empty">No hay ventas de productos en este período.</p>'}
+      </section>
+      <div class="report-stacked-panels">
+        <section class="report-panel">
+          <div class="report-panel-heading"><div><h3>Ventas por categoría</h3><p>Unidades y valor del período.</p></div></div>
+          ${byCategory.length ? `<div class="report-breakdown">${byCategory.map((category) => `<div class="report-breakdown-row"><div><strong>${escapeHtml(category.category)}</strong><span>${category.unitsSold} unidades</span></div><strong class="report-number">${fmtMoney(category.revenue)}</strong></div>`).join('')}</div>` : '<p class="report-empty">No hay ventas por categoría en estas fechas.</p>'}
+        </section>
+        <section class="report-panel">
+          <div class="report-panel-heading"><div><h3>Movimientos de stock</h3><p>Cambios registrados en estas fechas.</p></div></div>
+          ${movements.length ? `<div class="report-movement-list">${movements.map((movement) => `<div><span>${capitalize(movement.type)}</span><strong>${movement.movementCount}</strong><small>${movement.netChange > 0 ? '+' : ''}${movement.netChange} unidades</small></div>`).join('')}</div>` : '<p class="report-empty">No hay movimientos de inventario en estas fechas.</p>'}
+        </section>
+      </div>
     </div>
   `;
 }

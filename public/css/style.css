@@ -798,9 +798,135 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .dashboard-section .nav-tile:hover { border-color: #c9b991; background: #fff; }
 .dashboard-section .nav-tile:hover .nav-arrow { color: var(--wine); transform: translate(2px, -2px); }
 
+.report-heading {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 20px;
+  margin-bottom: 18px;
+}
+.report-heading .eyebrow,
+.report-period-controls > .eyebrow {
+  display: block;
+  margin: 0 0 5px;
+  color: var(--gold);
+  font-size: 10px;
+  font-weight: 700;
+}
+.report-heading .section-title { margin: 0; }
+.report-period-summary {
+  display: grid;
+  gap: 3px;
+  justify-items: end;
+  text-align: right;
+}
+.report-period-summary span { color: var(--ink-soft); font-size: 11px; }
+.report-period-summary strong { color: var(--wine-dark); font-size: 13px; font-weight: 600; }
+.report-controls { display: grid; gap: 14px; margin-bottom: 22px; }
+.report-period-controls .tab-row { margin: 0; }
+.report-view-tabs {
+  display: flex;
+  gap: 4px;
+  width: fit-content;
+  max-width: 100%;
+  padding: 4px;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #e9ece9;
+}
+.report-view-tab {
+  min-height: 38px;
+  flex: 0 0 auto;
+  padding: 8px 15px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--ink-soft);
+  font: 600 13px var(--font-body);
+  cursor: pointer;
+}
+.report-view-tab:hover { color: var(--wine-dark); }
+.report-view-tab.active {
+  background: #fff;
+  color: var(--wine-dark);
+  box-shadow: 0 1px 3px rgba(34, 30, 34, 0.1);
+}
+.report-view-intro { margin: 0 0 16px; }
+.report-view-intro h3 { margin: 0 0 4px; font-size: 20px; }
+.report-view-intro p,
+.report-panel-heading p { margin: 0; color: var(--ink-soft); font-size: 12px; line-height: 1.5; }
+.report-kpi-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); margin-bottom: 20px; }
+.report-kpi-grid .stat-card { min-height: 112px; }
+.report-kpi-grid .stat-card-featured { border-top-color: var(--champagne); }
+.report-panel {
+  min-width: 0;
+  padding: 18px 20px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+.report-panel-heading { display: flex; justify-content: space-between; gap: 14px; margin-bottom: 12px; }
+.report-panel-heading h3 { margin: 0 0 4px; font-size: 17px; }
+.report-panel svg { display: block; max-width: 100%; }
+.report-two-column { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 14px; }
+.report-stacked-panels { display: grid; gap: 14px; }
+.report-empty { margin: 0; padding: 20px 8px; color: var(--ink-soft); font-size: 13px; text-align: center; }
+.report-breakdown-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 12px 0;
+  border-top: 1px solid var(--line);
+}
+.report-breakdown-row:first-child { border-top: 0; }
+.report-breakdown-row > div { display: grid; gap: 3px; min-width: 0; }
+.report-breakdown-row > div strong { color: var(--ink); font-size: 13px; }
+.report-breakdown-row > div span,
+.report-ranking-row > div span,
+.report-ranking-total span { color: var(--ink-soft); font-size: 11px; }
+.report-number { flex: 0 0 auto; color: var(--wine-dark); font-size: 14px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.report-account-list { display: grid; gap: 14px; }
+.report-account-panel { padding: 18px 20px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+.report-account-title { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+.report-account-title > span { color: var(--gold); font-family: var(--font-display); font-size: 17px; }
+.report-account-title h3 { margin: 0; color: var(--wine-dark); font-size: 19px; }
+.report-account-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.report-account-metrics > div { min-width: 0; padding: 12px 14px; border-top: 1px solid var(--line); }
+.report-account-metrics > div:nth-child(4n + 1) { padding-left: 0; }
+.report-account-metrics > div > span { display: block; margin-bottom: 6px; color: var(--ink-soft); font-size: 11px; line-height: 1.35; }
+.report-account-metrics strong { display: block; color: var(--ink); font-size: 16px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.report-account-metrics small { display: block; margin-top: 3px; color: var(--ink-soft); font-size: 10px; }
+.report-account-metrics .report-account-balance { border-left: 2px solid var(--champagne); }
+.report-footnote { margin: 12px 2px 0; color: var(--ink-soft); font-size: 11px; line-height: 1.5; }
+.report-ranking-row {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 0;
+  border-top: 1px solid var(--line);
+}
+.report-ranking-row:first-child { border-top: 0; }
+.report-rank { color: var(--gold); font-family: var(--font-display); font-size: 15px; }
+.report-ranking-row > div { display: grid; gap: 3px; min-width: 0; }
+.report-ranking-row > div strong { overflow-wrap: anywhere; color: var(--ink); font-size: 12px; }
+.report-ranking-total { text-align: right; }
+.report-ranking-total strong { color: var(--wine-dark); font-size: 13px; font-variant-numeric: tabular-nums; }
+.report-movement-list { display: flex; flex-wrap: wrap; gap: 8px; }
+.report-movement-list > div { display: flex; align-items: baseline; gap: 6px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; background: #f7f8f6; }
+.report-movement-list span { color: var(--ink-soft); font-size: 11px; }
+.report-movement-list strong { color: var(--wine-dark); font-size: 13px; }
+.report-movement-list small { color: var(--ink-soft); font-size: 10px; }
+
 @media (max-width: 920px) {
   .dashboard-section .stat-grid,
   .dashboard-section .nav-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .report-kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .report-account-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .report-account-metrics > div:nth-child(4n + 1) { padding-left: 14px; }
+  .report-account-metrics > div:nth-child(3n + 1) { padding-left: 0; }
 }
 
 @media (max-width: 560px) {
@@ -828,4 +954,18 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   .dashboard-section .nav-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
   .dashboard-section .nav-tile { grid-template-columns: 31px minmax(0, 1fr) 14px; gap: 8px; min-height: 64px; padding: 10px; font-size: 12px; }
   .nav-index { width: 29px; height: 29px; font-size: 13px; }
+  .report-heading { align-items: flex-start; flex-direction: column; gap: 8px; }
+  .report-period-summary { justify-items: start; text-align: left; }
+  .report-controls { gap: 10px; }
+  .report-view-tabs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); width: 100%; overflow: visible; }
+  .report-view-tab { padding-inline: 11px; font-size: 12px; }
+  .report-two-column { grid-template-columns: 1fr; }
+  .report-account-panel { padding: 15px 14px; }
+  .report-account-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .report-account-metrics > div,
+  .report-account-metrics > div:nth-child(3n + 1),
+  .report-account-metrics > div:nth-child(4n + 1) { padding: 11px 8px; }
+  .report-account-metrics > div:nth-child(2n + 1) { padding-left: 0; }
+  .report-account-metrics strong { font-size: 14px; }
+  .report-kpi-grid .stat-card { min-height: 100px; }
 }
