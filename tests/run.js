@@ -126,6 +126,49 @@ async function testReportsIncludeAccountPayments() {
   }
 }
 
+async function testAccountActivityReport() {
+  const originalQuery = pool.query;
+  let modernSchema = true;
+  const queries = [];
+  pool.query = async (sql) => {
+    queries.push(sql);
+    if (sql.includes('information_schema.columns')) {
+      return {
+        rows: modernSchema
+          ? [
+            { table_name: 'separated_order_items', column_name: 'separated_order_id' },
+            { table_name: 'separated_payments', column_name: 'separated_order_id' },
+          ]
+          : [
+            { table_name: 'separated_order_items', column_name: 'order_id' },
+            { table_name: 'separated_payments', column_name: 'order_id' },
+          ],
+      };
+    }
+    if (sql.includes('FROM credit_sales cs')) {
+      return { rows: [{ accounts_created: 2, units_added: 3, product_lines: 2, products_value: '250', payment_count: 1, payments_received: '70', refunds_issued: '10', open_balance: '420' }] };
+    }
+    if (sql.includes('FROM separated_orders so')) {
+      return { rows: [{ accounts_created: 1, units_added: 4, product_lines: 3, products_value: '300', payment_count: 2, payments_received: '120', refunds_issued: '20', open_balance: '180' }] };
+    }
+    throw new Error(`Consulta inesperada en prueba de actividad de cuentas: ${sql}`);
+  };
+  try {
+    const modern = await reports.accountActivity('2026-10-01', '2026-10-01');
+    assert(modern.fiados.accountsCreated === 2 && modern.fiados.unitsAdded === 3 && modern.fiados.productsValue === 250, 'Informe de fiados calcula cuentas, unidades y valor del rango');
+    assert(modern.fiados.netCollected === 60 && modern.fiados.openBalance === 420, 'Informe de fiados separa recaudo neto del saldo abierto actual');
+    assert(modern.separados.unitsAdded === 4 && modern.separados.netCollected === 100, 'Informe de separados calcula unidades y recaudo descontando devoluciones');
+    assert(queries.some((sql) => sql.includes('soi.separated_order_id')) && queries.some((sql) => sql.includes('p.separated_order_id = so.id')), 'La consulta utiliza llaves del esquema moderno de separados');
+
+    modernSchema = false;
+    queries.length = 0;
+    await reports.accountActivity('2026-10-01', '2026-10-01');
+    assert(queries.some((sql) => sql.includes('soi.order_id')) && queries.some((sql) => sql.includes('p.order_id = so.id')), 'La consulta también admite el esquema antiguo de separados');
+  } finally {
+    pool.query = originalQuery;
+  }
+}
+
 async function run() {
   console.log('--- LOCAL DATE AND MONEY ---');
   assert(businessDate(new Date('2026-10-02T02:00:00Z')) === '2026-10-01', 'La fecha de negocio respeta la zona horaria de Colombia');
@@ -140,6 +183,7 @@ async function run() {
   assert(orderedItems[0].variantId === 3 && unorderedItems[0].variantId === 20, 'El orden global de locks es estable y no muta el carrito');
   await testMissingInventoryRow();
   await testReportsIncludeAccountPayments();
+  await testAccountActivityReport();
   if (!process.argv.includes('--e2e')) {
     console.log(`\n${passed} pruebas locales pasaron.`);
     if (failed > 0) process.exitCode = 1;
@@ -180,6 +224,7 @@ async function run() {
 
   r = await req('GET', '/api/dashboard');
   assert(r.status === 200 && Number.isInteger(r.data.inventoryUnits) && Number.isInteger(r.data.availableInventoryUnits), 'Dashboard devuelve unidades físicas y disponibles');
+  assert(Number.isInteger(r.data.creditUnitsToday) && Number.isInteger(r.data.separatedUnitsToday), 'Dashboard devuelve unidades fiadas y separadas hoy');
 
   r = await req('POST', '/api/categories', { name: TEST_CATEGORY_NAME });
   assert(r.status === 200, 'Crear categoría nueva funciona');
@@ -308,6 +353,7 @@ async function run() {
   console.log('--- REPORTS ---');
   r = await req('GET', '/api/reports/overview');
   assert(r.status === 200 && typeof r.data.revenue === 'number', 'Informe general (overview) responde con ingresos numéricos');
+  assert(r.data.accountActivity?.fiados && r.data.accountActivity?.separados, 'Informe general incluye actividad separada de fiados y separados');
   assert(r.data.saleCount >= 2, 'Informe general cuenta las ventas completadas del rango');
 
   r = await req('GET', '/api/reports/sales-timeline?groupBy=day');

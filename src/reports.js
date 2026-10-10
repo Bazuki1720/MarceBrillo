@@ -118,6 +118,69 @@ async function totals(from, to) {
   };
 }
 
+async function accountActivity(from, to) {
+  const { fromDate, toDate } = resolveRange(from, to);
+  const columnsRes = await pool.query(
+    `SELECT table_name, column_name FROM information_schema.columns
+     WHERE table_name IN ('separated_order_items', 'separated_payments')`
+  );
+  const separatedColumns = new Map();
+  for (const row of columnsRes.rows) {
+    if (!separatedColumns.has(row.table_name)) separatedColumns.set(row.table_name, new Set());
+    separatedColumns.get(row.table_name).add(row.column_name);
+  }
+  const modernSeparated = separatedColumns.get('separated_order_items')?.has('separated_order_id')
+    && separatedColumns.get('separated_payments')?.has('separated_order_id');
+  const separatedOrderKey = modernSeparated ? 'separated_order_id' : 'order_id';
+  const accountQueries = [
+    pool.query(
+      `SELECT
+         (SELECT COUNT(*)::int FROM credit_sales cs WHERE cs.created_at BETWEEN $1 AND $2 AND cs.status <> 'anulado') AS accounts_created,
+         (SELECT COALESCE(SUM(csi.quantity), 0)::int FROM credit_sale_items csi JOIN credit_sales cs ON cs.id = csi.credit_sale_id WHERE csi.created_at BETWEEN $1 AND $2 AND cs.status <> 'anulado') AS units_added,
+         (SELECT COUNT(*)::int FROM credit_sale_items csi JOIN credit_sales cs ON cs.id = csi.credit_sale_id WHERE csi.created_at BETWEEN $1 AND $2 AND cs.status <> 'anulado') AS product_lines,
+         (SELECT COALESCE(SUM(csi.subtotal), 0)::numeric FROM credit_sale_items csi JOIN credit_sales cs ON cs.id = csi.credit_sale_id WHERE csi.created_at BETWEEN $1 AND $2 AND cs.status <> 'anulado') AS products_value,
+         (SELECT COUNT(*)::int FROM credit_payments WHERE created_at BETWEEN $1 AND $2) AS payment_count,
+         (SELECT COALESCE(SUM(amount), 0)::numeric FROM credit_payments WHERE created_at BETWEEN $1 AND $2) AS payments_received,
+         (SELECT COALESCE(SUM(amount), 0)::numeric FROM account_refunds WHERE credit_sale_id IS NOT NULL AND created_at BETWEEN $1 AND $2) AS refunds_issued,
+         (SELECT COALESCE(SUM(GREATEST(cs.total - COALESCE(p.paid, 0), 0)), 0)::numeric
+          FROM credit_sales cs LEFT JOIN (SELECT credit_sale_id, SUM(amount) AS paid FROM credit_payments GROUP BY credit_sale_id) p ON p.credit_sale_id = cs.id
+          WHERE cs.status <> 'anulado') AS open_balance`,
+      [fromDate, toDate]
+    ),
+    pool.query(
+      `SELECT
+         (SELECT COUNT(*)::int FROM separated_orders so WHERE so.created_at BETWEEN $1 AND $2 AND so.status <> 'anulado') AS accounts_created,
+         (SELECT COALESCE(SUM(soi.quantity), 0)::int FROM separated_order_items soi JOIN separated_orders so ON so.id = soi.${modernSeparated ? 'separated_order_id' : 'order_id'} WHERE soi.created_at BETWEEN $1 AND $2 AND so.status <> 'anulado') AS units_added,
+         (SELECT COUNT(*)::int FROM separated_order_items soi JOIN separated_orders so ON so.id = soi.${modernSeparated ? 'separated_order_id' : 'order_id'} WHERE soi.created_at BETWEEN $1 AND $2 AND so.status <> 'anulado') AS product_lines,
+         (SELECT COALESCE(SUM(soi.subtotal), 0)::numeric FROM separated_order_items soi JOIN separated_orders so ON so.id = soi.${modernSeparated ? 'separated_order_id' : 'order_id'} WHERE soi.created_at BETWEEN $1 AND $2 AND so.status <> 'anulado') AS products_value,
+         (SELECT COUNT(*)::int FROM separated_payments WHERE created_at BETWEEN $1 AND $2) AS payment_count,
+         (SELECT COALESCE(SUM(amount), 0)::numeric FROM separated_payments WHERE created_at BETWEEN $1 AND $2) AS payments_received,
+         (SELECT COALESCE(SUM(amount), 0)::numeric FROM account_refunds WHERE separated_order_id IS NOT NULL AND created_at BETWEEN $1 AND $2) AS refunds_issued,
+         (SELECT COALESCE(SUM(GREATEST(so.total - COALESCE(p.paid, 0), 0)), 0)::numeric
+          FROM separated_orders so LEFT JOIN (SELECT ${separatedOrderKey}, SUM(amount) AS paid FROM separated_payments GROUP BY ${separatedOrderKey}) p ON p.${separatedOrderKey} = so.id
+          WHERE so.status <> 'anulado') AS open_balance`,
+      [fromDate, toDate]
+    ),
+  ];
+  const [creditRes, separatedRes] = await Promise.all(accountQueries);
+  const normalize = (row) => {
+    const paymentsReceived = Number(row.payments_received || 0);
+    const refundsIssued = Number(row.refunds_issued || 0);
+    return {
+      accountsCreated: Number(row.accounts_created || 0),
+      unitsAdded: Number(row.units_added || 0),
+      productLines: Number(row.product_lines || 0),
+      productsValue: Number(row.products_value || 0),
+      paymentCount: Number(row.payment_count || 0),
+      paymentsReceived,
+      refundsIssued,
+      netCollected: paymentsReceived - refundsIssued,
+      openBalance: Number(row.open_balance || 0),
+    };
+  };
+  return { fiados: normalize(creditRes.rows[0]), separados: normalize(separatedRes.rows[0]) };
+}
+
 async function topProducts(from, to, limit) {
   const { fromDate, toDate } = resolveRange(from, to);
   const { rows } = await pool.query(
@@ -211,4 +274,4 @@ async function inventoryValue() {
   return { totalValue: Number(rows[0].total_value), totalUnits: rows[0].total_units };
 }
 
-module.exports = { salesSummary, totals, topProducts, byCategory, paymentSummary, movementsSummary, inventoryValue, resolveRange, businessDate };
+module.exports = { salesSummary, totals, accountActivity, topProducts, byCategory, paymentSummary, movementsSummary, inventoryValue, resolveRange, businessDate };

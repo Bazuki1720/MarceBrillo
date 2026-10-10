@@ -1626,7 +1626,10 @@ app.post('/api/sales/:id/void', requireAuth, h(async (req, res) => {
 // ---------- DASHBOARD ----------
 app.get('/api/dashboard', requireAuth, h(async (req, res) => {
   const today = reports.businessDate();
-  const t = await reports.totals(today, today);
+  const [t, accountActivity] = await Promise.all([
+    reports.totals(today, today),
+    reports.accountActivity(today, today),
+  ]);
   const [lowStock, inventorySummary, expiredSeparated] = await Promise.all([
     getLowStockProducts(),
     getInventorySummary(),
@@ -1637,6 +1640,10 @@ app.get('/api/dashboard', requireAuth, h(async (req, res) => {
     salesToday: t.revenue,
     salesCountToday: t.saleCount,
     itemsSoldToday: t.itemsSold,
+    creditUnitsToday: accountActivity.fiados.unitsAdded,
+    creditAccountsToday: accountActivity.fiados.accountsCreated,
+    separatedUnitsToday: accountActivity.separados.unitsAdded,
+    separatedAccountsToday: accountActivity.separados.accountsCreated,
     lowStockCount: lowStock.length,
     inventoryUnits: inventorySummary.totalUnits,
     availableInventoryUnits: inventorySummary.availableUnits,
@@ -1647,8 +1654,12 @@ app.get('/api/dashboard', requireAuth, h(async (req, res) => {
 // ---------- REPORTS ----------
 app.get('/api/reports/overview', requireAuth, h(async (req, res) => {
   const { from, to } = req.query;
-  const [t, inv] = await Promise.all([reports.totals(from, to), reports.inventoryValue()]);
-  res.json({ ...t, inventoryValue: inv.totalValue, inventoryUnits: inv.totalUnits });
+  const [t, inv, accountActivity] = await Promise.all([
+    reports.totals(from, to),
+    reports.inventoryValue(),
+    reports.accountActivity(from, to),
+  ]);
+  res.json({ ...t, inventoryValue: inv.totalValue, inventoryUnits: inv.totalUnits, accountActivity });
 }));
 
 app.get('/api/reports/sales-timeline', requireAuth, h(async (req, res) => {

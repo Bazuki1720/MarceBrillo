@@ -143,44 +143,79 @@ async function renderDashboard() {
   const renderToken = navigationToken;
   const data = await api.get('/api/dashboard');
   if (renderToken !== navigationToken) return;
+  const todayLabel = new Intl.DateTimeFormat('es-CO', {
+    timeZone: 'America/Bogota', weekday: 'long', day: 'numeric', month: 'long', year: 'numeric',
+  }).format(new Date());
+  const todayCompactLabel = new Intl.DateTimeFormat('es-CO', {
+    timeZone: 'America/Bogota', day: 'numeric', month: 'short', year: 'numeric',
+  }).format(new Date());
   view.innerHTML = `
-    <p class="hello">Hola, ${escapeHtml(CURRENT_USER.fullName.split(' ')[0])} 👋</p>
-    <div class="stat-grid">
-      <div class="card stat-card">
-        <div class="label">Ingresos de hoy</div>
-        <div class="value">${fmtMoney(data.incomeToday ?? data.salesToday)}</div>
+    <div class="dashboard-heading">
+      <div>
+        <p class="eyebrow">MARCE BRILLO Y ESTILO <span>·</span> RESUMEN DIARIO</p>
+        <h1 class="hello">Hola, Marce</h1>
       </div>
-      <div class="card stat-card">
-        <div class="label">Productos vendidos hoy</div>
-        <div class="value">${data.itemsSoldToday}</div>
-      </div>
-      <div class="card stat-card ${data.lowStockCount > 0 ? 'alert' : ''}">
-        <div class="label">Productos con poco stock</div>
-        <div class="value">${data.lowStockCount}</div>
-      </div>
-      <div class="card stat-card ${data.expiredSeparatedCount > 0 ? 'alert' : ''}">
-        <div class="label">Separados vencidos</div>
-        <div class="value">${data.expiredSeparatedCount || 0}</div>
-      </div>
-      <div class="card stat-card">
-        <div class="label">Unidades disponibles</div>
-        <div class="value">${data.availableInventoryUnits}</div>
-      </div>
-      <div class="card stat-card">
-        <div class="label">Unidades físicas</div>
-        <div class="value">${data.inventoryUnits}</div>
+      <div class="dashboard-date">
+        <span class="eyebrow">HOY EN TIENDA</span>
+        <time><span class="dashboard-date-wide">${escapeHtml(todayLabel)}</span><span class="dashboard-date-compact">${escapeHtml(todayCompactLabel)}</span></time>
       </div>
     </div>
-    <div class="nav-grid">
-      <button class="nav-tile" onclick="navigate('inventario')"><span class="icon">📦</span>Inventario</button>
-      <button class="nav-tile" onclick="navigate('venta')"><span class="icon">🛒</span>Registrar venta</button>
-      <button class="nav-tile" onclick="navigate('separados')"><span class="icon">📦</span>Separados</button>
-      <button class="nav-tile" onclick="navigate('fiados')"><span class="icon">🧾</span>Fiados</button>
-      <button class="nav-tile" onclick="navigate('producto-nuevo')"><span class="icon">➕</span>Nuevo producto</button>
-      <button class="nav-tile" onclick="navigate('historial')"><span class="icon">📋</span>Ventas</button>
-      <button class="nav-tile" onclick="navigate('informes')"><span class="icon">📊</span>Informes</button>
-      <button class="nav-tile" onclick="navigate('configuracion')"><span class="icon">⚙️</span>Configuración</button>
-    </div>
+    <section class="dashboard-section" aria-labelledby="dailyMetricsTitle">
+      <div class="dashboard-section-heading">
+        <div><span class="eyebrow">01 <span>·</span> ACTIVIDAD</span><h2 id="dailyMetricsTitle">La jornada</h2></div>
+        <button class="btn btn-primary dashboard-sale-action" onclick="navigate('venta')"><span aria-hidden="true">＋</span> Nueva venta</button>
+      </div>
+      <div class="stat-grid">
+        <div class="card stat-card stat-card-featured">
+          <div class="label">Ingresos de hoy</div>
+          <div class="value">${fmtMoney(data.incomeToday ?? data.salesToday)}</div>
+        </div>
+        <div class="card stat-card">
+          <div class="label">Productos vendidos</div>
+          <div class="value">${data.itemsSoldToday}</div>
+        </div>
+        <div class="card stat-card">
+          <div class="label">Unidades fiadas</div>
+          <div class="value">${data.creditUnitsToday || 0}</div>
+          <div class="stat-detail">${data.creditAccountsToday || 0} ${Number(data.creditAccountsToday) === 1 ? 'cuenta' : 'cuentas'}</div>
+        </div>
+        <div class="card stat-card">
+          <div class="label">Unidades separadas</div>
+          <div class="value">${data.separatedUnitsToday || 0}</div>
+          <div class="stat-detail">${data.separatedAccountsToday || 0} ${Number(data.separatedAccountsToday) === 1 ? 'cuenta' : 'cuentas'}</div>
+        </div>
+        <div class="card stat-card ${data.lowStockCount > 0 ? 'alert' : ''}">
+          <div class="label">Poco stock</div>
+          <div class="value">${data.lowStockCount}</div>
+        </div>
+        <div class="card stat-card ${data.expiredSeparatedCount > 0 ? 'alert' : ''}">
+          <div class="label">Separados vencidos</div>
+          <div class="value">${data.expiredSeparatedCount || 0}</div>
+        </div>
+        <div class="card stat-card">
+          <div class="label">Unidades disponibles</div>
+          <div class="value">${data.availableInventoryUnits}</div>
+        </div>
+        <div class="card stat-card">
+          <div class="label">Unidades físicas</div>
+          <div class="value">${data.inventoryUnits}</div>
+        </div>
+      </div>
+    </section>
+    <section class="dashboard-section" aria-labelledby="storeModulesTitle">
+      <div class="dashboard-section-heading">
+        <div><span class="eyebrow">02 <span>·</span> PUNTO DE VENTA</span><h2 id="storeModulesTitle">Espacios de trabajo</h2></div>
+      </div>
+      <div class="nav-grid">
+        <button class="nav-tile" onclick="navigate('inventario')"><span class="nav-index">01</span><span class="nav-label">Inventario</span><span class="nav-arrow" aria-hidden="true">↗</span></button>
+        <button class="nav-tile" onclick="navigate('separados')"><span class="nav-index">02</span><span class="nav-label">Separados</span><span class="nav-arrow" aria-hidden="true">↗</span></button>
+        <button class="nav-tile" onclick="navigate('fiados')"><span class="nav-index">03</span><span class="nav-label">Fiados</span><span class="nav-arrow" aria-hidden="true">↗</span></button>
+        <button class="nav-tile" onclick="navigate('producto-nuevo')"><span class="nav-index">04</span><span class="nav-label">Nuevo producto</span><span class="nav-arrow" aria-hidden="true">↗</span></button>
+        <button class="nav-tile" onclick="navigate('historial')"><span class="nav-index">05</span><span class="nav-label">Ventas</span><span class="nav-arrow" aria-hidden="true">↗</span></button>
+        <button class="nav-tile" onclick="navigate('informes')"><span class="nav-index">06</span><span class="nav-label">Informes</span><span class="nav-arrow" aria-hidden="true">↗</span></button>
+        <button class="nav-tile" onclick="navigate('configuracion')"><span class="nav-index">07</span><span class="nav-label">Configuración</span><span class="nav-arrow" aria-hidden="true">↗</span></button>
+      </div>
+    </section>
   `;
 }
 
@@ -1673,6 +1708,12 @@ async function loadReportBody() {
 
   const container = document.getElementById('reportBody');
   if (!container || renderToken !== navigationToken || from !== reportRange.from || to !== reportRange.to) return;
+  const creditActivity = overview.accountActivity?.fiados || {};
+  const separatedActivity = overview.accountActivity?.separados || {};
+  const accountActivityRows = [
+    { label: 'Fiados', activity: creditActivity },
+    { label: 'Separados', activity: separatedActivity },
+  ];
   container.innerHTML = `
     <div class="stat-grid">
       <div class="card stat-card"><div class="label">Ingresos</div><div class="value">${fmtMoney(overview.revenue)}</div></div>
@@ -1681,6 +1722,35 @@ async function loadReportBody() {
       <div class="card stat-card"><div class="label">Ticket promedio</div><div class="value">${fmtMoney(overview.avgTicket)}</div></div>
       <div class="card stat-card ${overview.voidedCount > 0 ? 'alert' : ''}"><div class="label">Ventas anuladas</div><div class="value">${overview.voidedCount}</div></div>
       <div class="card stat-card"><div class="label">Valor del inventario</div><div class="value">${fmtMoney(overview.inventoryValue)}</div></div>
+    </div>
+
+    <h3>Informe de fiados y separados</h3>
+    <div class="card" style="margin-bottom:24px;overflow-x:auto">
+      <table style="width:100%;min-width:900px;border-collapse:collapse;text-align:right">
+        <thead><tr style="border-bottom:1px solid var(--line)">
+          <th style="padding:10px;text-align:left">Tipo</th>
+          <th style="padding:10px">Cuentas creadas</th>
+          <th style="padding:10px">Unidades agregadas</th>
+          <th style="padding:10px">Valor de productos</th>
+          <th style="padding:10px">Abonos del período</th>
+          <th style="padding:10px">Devoluciones</th>
+          <th style="padding:10px">Recaudo neto</th>
+          <th style="padding:10px">Saldo abierto actual</th>
+        </tr></thead>
+        <tbody>${accountActivityRows.map(({ label, activity }) => `
+          <tr style="border-bottom:1px solid var(--line)">
+            <th scope="row" style="padding:12px 10px;text-align:left">${label}</th>
+            <td style="padding:12px 10px">${activity.accountsCreated || 0}</td>
+            <td style="padding:12px 10px">${activity.unitsAdded || 0} <span class="meta">(${activity.productLines || 0} líneas)</span></td>
+            <td style="padding:12px 10px">${fmtMoney(activity.productsValue || 0)}</td>
+            <td style="padding:12px 10px">${fmtMoney(activity.paymentsReceived || 0)} <span class="meta">(${activity.paymentCount || 0})</span></td>
+            <td style="padding:12px 10px">${fmtMoney(activity.refundsIssued || 0)}</td>
+            <td style="padding:12px 10px;font-weight:700">${fmtMoney(activity.netCollected || 0)}</td>
+            <td style="padding:12px 10px;font-weight:700">${fmtMoney(activity.openBalance || 0)}</td>
+          </tr>
+        `).join('')}</tbody>
+      </table>
+      <p class="helper-text" style="margin:12px 10px 0">La actividad y los abonos corresponden al período seleccionado; el saldo abierto es el actual de todas las cuentas vigentes.</p>
     </div>
 
     <h3>¿Cómo entró el dinero?</h3>
