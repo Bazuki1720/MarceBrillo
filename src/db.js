@@ -335,6 +335,49 @@ BEGIN
       CHECK (payment_destination IN ('nequi','qr','daviplata'));
   END IF;
 END $$;
+
+-- Backfill item timestamps in databases created before account item dates existed.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'credit_sale_items' AND column_name = 'created_at'
+  ) THEN
+    ALTER TABLE credit_sale_items ADD COLUMN created_at TIMESTAMPTZ;
+  END IF;
+  UPDATE credit_sale_items csi
+  SET created_at = cs.created_at
+  FROM credit_sales cs
+  WHERE cs.id = csi.credit_sale_id AND csi.created_at IS NULL;
+  ALTER TABLE credit_sale_items ALTER COLUMN created_at SET DEFAULT now();
+  ALTER TABLE credit_sale_items ALTER COLUMN created_at SET NOT NULL;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'separated_order_items' AND column_name = 'created_at'
+  ) THEN
+    ALTER TABLE separated_order_items ADD COLUMN created_at TIMESTAMPTZ;
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'separated_order_items' AND column_name = 'separated_order_id'
+  ) THEN
+    UPDATE separated_order_items soi
+    SET created_at = so.created_at
+    FROM separated_orders so
+    WHERE so.id = soi.separated_order_id AND soi.created_at IS NULL;
+  ELSE
+    UPDATE separated_order_items soi
+    SET created_at = so.created_at
+    FROM separated_orders so
+    WHERE so.id = soi.order_id AND soi.created_at IS NULL;
+  END IF;
+  ALTER TABLE separated_order_items ALTER COLUMN created_at SET DEFAULT now();
+  ALTER TABLE separated_order_items ALTER COLUMN created_at SET NOT NULL;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_credit_sale_items_created ON credit_sale_items(created_at);
+CREATE INDEX IF NOT EXISTS idx_separated_order_items_created ON separated_order_items(created_at);
 `;
 
 async function initSchema() {
