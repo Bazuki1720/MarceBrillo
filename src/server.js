@@ -116,7 +116,7 @@ app.post('/api/logout', (req, res) => {
 });
 
 app.get('/api/me', requireAuth, (req, res) => {
-  res.json({ userId: req.session.userId, username: req.session.username, fullName: req.session.fullName, role: req.session.role, canResetData });
+  res.json({ userId: req.session.userId, username: req.session.username, fullName: req.session.fullName, role: req.session.role, canResetData, supportsLiveUpdates: changeNotificationsSupported });
 });
 
 app.get('/api/events', requireAuth, (req, res) => {

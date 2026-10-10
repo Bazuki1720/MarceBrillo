@@ -1,6 +1,7 @@
 let CURRENT_USER = null;
 let CATEGORIES = [];
 const view = document.getElementById('view');
+const LIVE_REFRESH_FALLBACK_MS = 60000;
 let navigationToken = 0;
 let liveRefreshTimer = null;
 let liveRefreshPending = false;
@@ -21,11 +22,11 @@ async function init() {
   } catch (e) { CATEGORIES = []; }
 
   window.addEventListener('hashchange', router);
-  startLiveUpdates();
+  startLiveUpdates(CURRENT_USER.supportsLiveUpdates);
   router();
 }
 
-function startLiveUpdates() {
+function startLiveUpdates(supportsLiveUpdates) {
   const events = new EventSource('/api/events');
   events.addEventListener('change', scheduleLiveRefresh);
   window.addEventListener('focusout', () => {
@@ -34,7 +35,7 @@ function startLiveUpdates() {
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) scheduleLiveRefresh();
   });
-  window.setInterval(scheduleLiveRefresh, 5000);
+  if (!supportsLiveUpdates) window.setInterval(scheduleLiveRefresh, LIVE_REFRESH_FALLBACK_MS);
 }
 
 function scheduleLiveRefresh() {
