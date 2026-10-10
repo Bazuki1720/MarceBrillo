@@ -303,6 +303,22 @@ async function run() {
   assert(r.status === 200, 'Venta con múltiples productos se registra');
   assert(r.data.total === (productWithSizes.price * 2 + productNoSizes.price * 1), 'El total de la venta multiproducto es correcto');
 
+  console.log('--- SALES: non-inventory item ---');
+  const stockBeforeNonInventorySale = (await req('GET', `/api/products/${productWithSizes.id}`)).data.total_stock;
+  r = await req('POST', '/api/sales/sin-inventario', {
+    description: 'Aretes artesanales', amount: 18500.5, paymentMethod: 'transferencia', paymentDestination: 'nequi',
+  });
+  assert(r.status === 200 && r.data.total === 18500.5, 'Registrar artículo sin inventario conserva el valor y método elegidos');
+  const nonInventorySaleId = r.data.saleId;
+  r = await req('GET', `/api/sales/${nonInventorySaleId}`);
+  assert(r.status === 200 && r.data.items.length === 0 && r.data.nonInventoryItems[0].description === 'Aretes artesanales', 'El detalle distingue artículos que no manejan existencias');
+  r = await req('GET', '/api/sales');
+  assert(r.status === 200 && r.data.some((sale) => sale.id === nonInventorySaleId && sale.has_non_inventory_items), 'La venta sin inventario aparece identificada en el historial');
+  r = await req('GET', `/api/products/${productWithSizes.id}`);
+  assert(r.data.total_stock === stockBeforeNonInventorySale, 'La venta sin inventario no cambia las existencias');
+  r = await req('POST', '/api/sales/sin-inventario', { description: '   ', amount: 0, paymentMethod: 'efectivo' });
+  assert(r.status === 400, 'La venta sin inventario valida descripción y valor positivos');
+
   console.log('--- SALE ZERO STOCK ---');
   r = await req('POST', '/api/inventory/adjust', { variantId: productNoSizes.variants[0].variant_id, newQuantity: 0, reason: 'test cero' });
   r = await req('POST', '/api/sales', { items: [{ variantId: productNoSizes.variants[0].variant_id, quantity: 1 }] });

@@ -130,6 +130,14 @@ CREATE TABLE IF NOT EXISTS sale_items (
   subtotal NUMERIC(12,2) NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS non_inventory_sale_items (
+  id SERIAL PRIMARY KEY,
+  sale_id INTEGER NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
+  description TEXT NOT NULL,
+  amount NUMERIC(12,2) NOT NULL CHECK (amount > 0),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS inventory_movements (
   id SERIAL PRIMARY KEY,
   variant_id INTEGER NOT NULL REFERENCES product_variants(id),
@@ -265,7 +273,7 @@ DECLARE
 BEGIN
   FOREACH table_name IN ARRAY ARRAY[
     'categories', 'users', 'products', 'product_variants', 'inventory',
-    'sales', 'sale_items', 'inventory_movements', 'separated_orders',
+    'sales', 'sale_items', 'non_inventory_sale_items', 'inventory_movements', 'separated_orders',
     'separated_order_items', 'separated_payments', 'credit_sales',
     'credit_sale_items', 'credit_payments', 'separated_payment_allocations',
     'credit_payment_allocations', 'account_refunds'
@@ -286,6 +294,7 @@ CREATE INDEX IF NOT EXISTS idx_sales_created ON sales(created_at);
 CREATE INDEX IF NOT EXISTS idx_sales_status ON sales(status);
 CREATE INDEX IF NOT EXISTS idx_sale_items_sale ON sale_items(sale_id);
 CREATE INDEX IF NOT EXISTS idx_sale_items_category ON sale_items(category_id);
+CREATE INDEX IF NOT EXISTS idx_non_inventory_sale_items_sale ON non_inventory_sale_items(sale_id);
 CREATE INDEX IF NOT EXISTS idx_movements_variant ON inventory_movements(variant_id);
 CREATE INDEX IF NOT EXISTS idx_movements_created ON inventory_movements(created_at);
 CREATE INDEX IF NOT EXISTS idx_separated_orders_status ON separated_orders(status);

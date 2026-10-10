@@ -1588,9 +1588,55 @@ app.post('/api/sales', requireAuth, h(async (req, res) => {
   }
 }));
 
+app.post('/api/sales/sin-inventario', requireAuth, h(async (req, res) => {
+  const { description, amount, paymentMethod, paymentDestination = null } = req.body || {};
+  if (typeof description !== 'string' || !description.trim() || description.trim().length > 180) {
+    return res.status(400).json({ error: 'Escribe una descripción de hasta 180 caracteres' });
+  }
+  const numericAmount = Number(amount);
+  if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
+    return res.status(400).json({ error: 'El valor de la venta debe ser mayor a cero' });
+  }
+  const amountCents = toCents(numericAmount);
+  if (!Number.isSafeInteger(amountCents) || amountCents <= 0 || amountCents > MAX_MONEY_CENTS) {
+    return res.status(400).json({ error: 'El valor supera el máximo permitido' });
+  }
+  if (!['efectivo', 'transferencia', 'addi'].includes(paymentMethod)) {
+    return res.status(400).json({ error: 'Selecciona un método de pago válido' });
+  }
+  if (paymentMethod === 'transferencia' && !['nequi', 'qr', 'daviplata'].includes(paymentDestination)) {
+    return res.status(400).json({ error: 'Indica dónde llegó la transferencia' });
+  }
+  if (paymentMethod !== 'transferencia' && paymentDestination !== null) {
+    return res.status(400).json({ error: 'El destino solo aplica para transferencias' });
+  }
+
+  const result = await withTransaction(async (client) => {
+    await client.query('SELECT pg_advisory_xact_lock($1)', [1874501]);
+    const countRes = await client.query('SELECT COUNT(*)::int AS c FROM sales');
+    const saleCount = countRes.rows[0].c + 1;
+    const ymd = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+    const saleNumber = `V-${ymd}-${String(saleCount).padStart(4, '0')}`;
+    const total = fromCents(amountCents);
+    const saleRes = await client.query(
+      `INSERT INTO sales (sale_number, user_id, total, payment_method, payment_destination, status)
+       VALUES ($1, $2, $3, $4, $5, 'completada') RETURNING id`,
+      [saleNumber, req.session.userId, total, paymentMethod, paymentDestination]
+    );
+    await client.query(
+      'INSERT INTO non_inventory_sale_items (sale_id, description, amount) VALUES ($1, $2, $3)',
+      [saleRes.rows[0].id, description.trim(), total]
+    );
+    return { saleId: saleRes.rows[0].id, saleNumber, total, type: 'sin_inventario' };
+  });
+  res.json(result);
+}));
+
 app.get('/api/sales', requireAuth, h(async (req, res) => {
   const { rows } = await pool.query(
-    `SELECT s.*, u.full_name as user_name FROM sales s JOIN users u ON u.id = s.user_id
+    `SELECT s.*, u.full_name as user_name,
+            EXISTS (SELECT 1 FROM non_inventory_sale_items nsi WHERE nsi.sale_id = s.id) AS has_non_inventory_items
+     FROM sales s JOIN users u ON u.id = s.user_id
      ORDER BY s.created_at DESC, s.id DESC`
   );
   res.json(rows.map((r) => ({ ...r, total: Number(r.total) })));
@@ -1604,10 +1650,12 @@ app.get('/api/sales/:id', requireAuth, h(async (req, res) => {
   const sale = saleRes.rows[0];
   if (!sale) return res.status(404).json({ error: 'Venta no encontrada' });
   const itemsRes = await pool.query('SELECT * FROM sale_items WHERE sale_id = $1', [sale.id]);
+  const nonInventoryItemsRes = await pool.query('SELECT * FROM non_inventory_sale_items WHERE sale_id = $1 ORDER BY id', [sale.id]);
   res.json({
     ...sale,
     total: Number(sale.total),
     items: itemsRes.rows.map((it) => ({ ...it, unit_price: Number(it.unit_price), subtotal: Number(it.subtotal) })),
+    nonInventoryItems: nonInventoryItemsRes.rows.map((item) => ({ ...item, amount: Number(item.amount) })),
   });
 }));
 

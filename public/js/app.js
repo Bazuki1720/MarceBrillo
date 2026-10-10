@@ -1316,6 +1316,7 @@ async function renderSale() {
     <h2 class="section-title">Registrar venta</h2>
     <div class="searchbar">
       <input id="saleSearch" placeholder="Buscar referencia o nombre" autofocus />
+      <button class="btn btn-outline sale-no-stock-button" type="button" onclick="openNonInventorySaleModal()">Venta sin inventario</button>
     </div>
     <div id="saleResults"></div>
     <div id="cartSection" style="margin-top:24px"></div>
@@ -1327,6 +1328,75 @@ async function renderSale() {
     t = setTimeout(() => loadSaleSearchResults(input.value), 250);
   });
   renderCart();
+}
+
+function toggleNonInventoryDestination() {
+  const method = document.getElementById('nonInventoryPaymentMethod');
+  const field = document.getElementById('nonInventoryDestinationField');
+  if (method && field) field.style.display = method.value === 'transferencia' ? 'block' : 'none';
+}
+
+function openNonInventorySaleModal() {
+  showModal(`
+    <h3>Venta sin inventario</h3>
+    <p class="helper-text">Para accesorios u otros artículos que no manejas en existencias.</p>
+    <form id="nonInventorySaleForm">
+      <div class="field">
+        <label for="nonInventoryDescription">¿Qué se vendió?</label>
+        <input id="nonInventoryDescription" maxlength="180" placeholder="Ej.: Aretes dorados" required />
+      </div>
+      <div class="field">
+        <label for="nonInventoryAmount">Valor recibido</label>
+        <input id="nonInventoryAmount" type="number" min="0.01" max="9999999999.99" step="0.01" placeholder="0" required />
+      </div>
+      <div class="field">
+        <label for="nonInventoryPaymentMethod">Método de pago</label>
+        <select id="nonInventoryPaymentMethod" onchange="toggleNonInventoryDestination()">
+          <option value="efectivo">Efectivo</option>
+          <option value="transferencia">Transferencia</option>
+          <option value="addi">Addi</option>
+        </select>
+      </div>
+      <div id="nonInventoryDestinationField" class="field" style="display:none">
+        <label for="nonInventoryPaymentDestination">¿A dónde llegó?</label>
+        <select id="nonInventoryPaymentDestination">
+          <option value="nequi">Nequi</option>
+          <option value="qr">QR</option>
+          <option value="daviplata">Daviplata</option>
+        </select>
+      </div>
+      <button class="btn btn-primary btn-block" type="submit">Registrar venta</button>
+    </form>
+  `);
+  document.getElementById('nonInventorySaleForm').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    if (form.dataset.submitting === 'true') return;
+    const paymentMethod = document.getElementById('nonInventoryPaymentMethod').value;
+    const payload = {
+      description: document.getElementById('nonInventoryDescription').value,
+      amount: Number(document.getElementById('nonInventoryAmount').value),
+      paymentMethod,
+      paymentDestination: paymentMethod === 'transferencia'
+        ? document.getElementById('nonInventoryPaymentDestination').value
+        : null,
+    };
+    const submitButton = form.querySelector('button[type="submit"]');
+    form.dataset.submitting = 'true';
+    submitButton.disabled = true;
+    submitButton.textContent = 'Registrando...';
+    try {
+      const result = await api.post('/api/sales/sin-inventario', payload);
+      closeModal();
+      toast(`Venta ${result.saleNumber} registrada`, 'success');
+      navigate('venta-detalle/' + result.saleId);
+    } catch (error) {
+      toast(error.message, 'error');
+      form.dataset.submitting = 'false';
+      submitButton.disabled = false;
+      submitButton.textContent = 'Registrar venta';
+    }
+  });
 }
 
 function togglePaymentDestination() {
@@ -1481,6 +1551,7 @@ async function renderHistory() {
             <strong>${escapeHtml(s.sale_number)}</strong>
             <span class="badge ${s.status === 'anulada' ? 'badge-danger' : 'badge-ok'}">${s.status === 'anulada' ? 'Anulada' : 'Completada'}</span>
           </div>
+          ${s.has_non_inventory_items ? '<span class="badge badge-gold">Sin inventario</span>' : ''}
           <div class="meta">${new Date(s.created_at).toLocaleString('es-CO')} · ${escapeHtml(s.user_name)} · ${paymentLabel(s.payment_method, s.payment_destination)}</div>
           <div class="total-stock">${fmtMoney(s.total)}</div>
         </div>
@@ -1500,27 +1571,33 @@ async function renderSaleDetail(id) {
       <span class="badge ${sale.status === 'anulada' ? 'badge-danger' : 'badge-ok'}">${sale.status === 'anulada' ? 'Anulada' : 'Completada'}</span>
       ${sale.status === 'anulada' ? `<p class="meta">Motivo: ${escapeHtml(sale.void_reason || '—')}</p>` : ''}
     </div>
-    <h3>Productos</h3>
-    ${sale.items.map((it) => `
+    ${sale.items.length ? `<h3>Productos con inventario</h3>${sale.items.map((it) => `
       <div class="product-item">
         <div class="ref">${escapeHtml(it.product_reference)}</div>
         <div class="name">${escapeHtml(it.product_name)} ${it.size ? '· talla ' + escapeHtml(it.size) : ''}</div>
         <div class="meta">${it.quantity} × ${fmtMoney(it.unit_price)} = ${fmtMoney(it.subtotal)}</div>
       </div>
-    `).join('')}
+    `).join('')}` : ''}
+    ${sale.nonInventoryItems?.length ? `<h3>Artículos sin inventario</h3>${sale.nonInventoryItems.map((item) => `
+      <div class="product-item">
+        <div class="name">${escapeHtml(item.description)}</div>
+        <div class="meta">Venta sin control de existencias</div>
+        <div class="total-stock">${fmtMoney(item.amount)}</div>
+      </div>
+    `).join('')}` : ''}
     <div class="card" style="margin-top:18px;text-align:right">
       <span class="total-stock" style="font-size:20px">Total: ${fmtMoney(sale.total)}</span>
     </div>
     ${sale.status === 'completada' ? `
-      <button class="btn btn-danger btn-block" style="margin-top:20px" onclick="promptVoidSale(${sale.id})">Anular venta</button>
+      <button class="btn btn-danger btn-block" style="margin-top:20px" onclick="promptVoidSale(${sale.id}, ${sale.items.length > 0})">Anular venta</button>
     ` : ''}
   `;
 }
 
-function promptVoidSale(saleId) {
+function promptVoidSale(saleId, hasInventoryItems = true) {
   showModal(`
     <h3>Anular venta</h3>
-    <p class="helper-text">Esto devolverá los productos al inventario. Esta acción no se puede deshacer.</p>
+    <p class="helper-text">${hasInventoryItems ? 'Los productos con inventario se devolverán a existencias.' : 'Esta venta no modificó existencias.'} La anulación no se puede deshacer.</p>
     <form id="voidForm">
       <div class="field"><label>Motivo</label><input id="voidReason" placeholder="Ej: Cliente se arrepintió" required /></div>
       <button class="btn btn-danger btn-block" type="submit">Confirmar anulación</button>
@@ -1531,7 +1608,7 @@ function promptVoidSale(saleId) {
     try {
       await api.post(`/api/sales/${saleId}/void`, { reason: document.getElementById('voidReason').value });
       closeModal();
-      toast('Venta anulada, inventario restaurado', 'success');
+      toast(hasInventoryItems ? 'Venta anulada, inventario restaurado' : 'Venta anulada', 'success');
       renderSaleDetail(saleId);
     } catch (err) { toast(err.message, 'error'); }
   });

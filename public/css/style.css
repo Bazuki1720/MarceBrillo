@@ -653,6 +653,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 
 .searchbar { max-width: 820px; }
 .searchbar input, input[type="search"] { min-height: 44px; }
+.sale-no-stock-button { flex: 0 0 auto; min-height: 44px; white-space: nowrap; }
 .search-results { border-radius: 7px; }
 .search-results .btn-outline { text-align: left; }
 
@@ -968,4 +969,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   .report-account-metrics > div:nth-child(2n + 1) { padding-left: 0; }
   .report-account-metrics strong { font-size: 14px; }
   .report-kpi-grid .stat-card { min-height: 100px; }
+  .searchbar:has(.sale-no-stock-button) { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: stretch; gap: 7px; }
+  .searchbar:has(.sale-no-stock-button) input { min-width: 0; padding-inline: 10px; font-size: 13px; }
+  .sale-no-stock-button { padding-inline: 10px; font-size: 11px; }
 }
